@@ -1,0 +1,16 @@
+[
+    {
+        "id": "subway-entrance",
+        "preview_url": "https://cdn.myapp.com/previews/subway-entrance.jpg",
+        "path": "templates/subway-entrance/video.mp4",
+        "tracking_path": "templates/subway-entrance/tracking.json",
+        "resolution": [
+            1440,
+            1920
+        ],
+        "canvas_size": {
+            "width": 445,
+            "height": 214
+        }
+    }
+]

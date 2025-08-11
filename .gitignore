@@ -1,0 +1,25 @@
+# env & secrets
+.env
+*.env
+**/.env
+
+# python junk
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# venvs & tools
+.venv/
+.envrc
+pip-wheel-metadata/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# app temps
+/tmp/
+tmp/
+outputs/
