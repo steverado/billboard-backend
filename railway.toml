@@ -1,8 +1,8 @@
 [build]
-  builder = "dockerfile"
+builder = "nixpacks"
 
 [deploy]
-  healthcheckPath = "/health"
-  healthcheckTimeout = 300
-  restartPolicyType = "on_failure"
-  restartPolicyMaxRetries = 3
+healthcheckPath = "/healthz"   # make sure this matches your FastAPI route
+healthcheckTimeout = 300
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
