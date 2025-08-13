@@ -13,3 +13,5 @@ rq==1.16.2
 
 boto3==1.34.162
 botocore==1.34.162
+pydantic==2.8.2
+loguru==0.7.2
