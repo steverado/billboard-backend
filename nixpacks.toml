@@ -1,8 +1,13 @@
+# nixpacks.toml
+
 [phases.setup]
-nixPkgs = ["ffmpeg"]
+# Ensure Python and ffmpeg are available no matter what
+# (python311 provides the interpreter; we'll use `python -m pip` so we don't care if `pip` shim exists)
+nixPkgs = ["python311", "ffmpeg"]
 
 [phases.install]
-cmds = ["pip install --no-cache-dir -r requirements.txt"]
+# Use python -m pip to avoid PATH/pip shim issues
+cmds = ["python -m pip install --no-cache-dir -r requirements.txt"]
 
 [start]
-cmd = "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers"
+cmd = "python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers"
