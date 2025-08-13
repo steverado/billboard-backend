@@ -1,7 +1,7 @@
 # nixpacks.toml
 
 [phases.setup]
-# Bring Python + toolchain + ffmpeg + common OpenCV/GUI deps
+# Ensure Python + toolchain + ffmpeg + common OpenCV deps
 nixPkgs = [
   "python311",
   "gcc",
@@ -14,16 +14,18 @@ nixPkgs = [
   "xorg.libXrender",
   "gtk3"
 ]
+# Create a dedicated virtualenv so pip isn't blocked by PEP 668
+cmds = [
+  "python -m venv /opt/venv"
+]
 
 [phases.install]
-# 1) upgrade build tooling with verbose logs
-# 2) preinstall heavy packages from wheels only (avoid source builds)
-# 3) install the rest with verbose logs so we see the exact failure
+# Use the venv's python for ALL installs (avoids 'externally managed' error)
 cmds = [
-  "python -m pip install --upgrade pip setuptools wheel -v",
-  "python -m pip install --only-binary=:all: -v numpy opencv-python-headless uvloop httptools",
-  "python -m pip install --no-cache-dir -v -r requirements.txt"
+  "/opt/venv/bin/python -m pip install --upgrade pip setuptools wheel -v",
+  "/opt/venv/bin/python -m pip install --only-binary=:all: -v numpy opencv-python-headless uvloop httptools",
+  "/opt/venv/bin/python -m pip install --no-cache-dir -v -r requirements.txt"
 ]
 
 [start]
-cmd = "python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers"
+cmd = "/opt/venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers"
