@@ -1,13 +1,29 @@
 # nixpacks.toml
 
 [phases.setup]
-# Ensure Python and ffmpeg are available no matter what
-# (python311 provides the interpreter; we'll use `python -m pip` so we don't care if `pip` shim exists)
-nixPkgs = ["python311", "ffmpeg"]
+# Bring Python + toolchain + ffmpeg + common OpenCV/GUI deps
+nixPkgs = [
+  "python311",
+  "gcc",
+  "pkg-config",
+  "ffmpeg",
+  "glib",
+  "libGL",
+  "xorg.libXext",
+  "xorg.libSM",
+  "xorg.libXrender",
+  "gtk3"
+]
 
 [phases.install]
-# Use python -m pip to avoid PATH/pip shim issues
-cmds = ["python -m pip install --no-cache-dir -r requirements.txt"]
+# 1) upgrade build tooling with verbose logs
+# 2) preinstall heavy packages from wheels only (avoid source builds)
+# 3) install the rest with verbose logs so we see the exact failure
+cmds = [
+  "python -m pip install --upgrade pip setuptools wheel -v",
+  "python -m pip install --only-binary=:all: -v numpy opencv-python-headless uvloop httptools",
+  "python -m pip install --no-cache-dir -v -r requirements.txt"
+]
 
 [start]
 cmd = "python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers"
