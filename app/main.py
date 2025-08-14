@@ -37,6 +37,21 @@ logger = logging.getLogger("uvicorn.error")
 # FastAPI app
 app = FastAPI()
 
+# after: app = FastAPI()
+from fastapi.responses import JSONResponse
+
+
+@app.get("/healthz", include_in_schema=False)
+def healthz():
+    return JSONResponse({"ok": True, "service": "billboard-backend"}, status_code=200)
+
+
+# optional alias if you ever point Railway to /health instead
+@app.get("/health", include_in_schema=False)
+def health_alias():
+    return {"ok": True}
+
+
 # Middleware
 app.add_middleware(
     CORSMiddleware,
