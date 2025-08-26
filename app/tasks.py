@@ -82,41 +82,53 @@ def process_video_task(
 
             job_store.set(job_id, {"job_id": job_id, "status": "processing", "progress": 40})
 
-            # 2) Render
-            try:
-                compositor = EnhancedQualityCompositor(quality_preset="high")
-                # Your compositor writes "<stem>.mp4" and may return the final path or None.
-                final_path = asyncio.run(
-                    compositor.process_video(
-                        template_id=template_name,
-                        user_file=local_input,
-                        output_path=local_output_stem,
-                        job_id=job_id,
-                    )
+                    # 2) Render
+        try:
+            compositor = EnhancedQualityCompositor(quality_preset="high")
+            # Your compositor may write "<stem>.mp4" and return a path with or without ".mp4"
+            returned_path = asyncio.run(
+                compositor.process_video(
+                    template_id=template_name,
+                    user_file=local_input,
+                    output_path=local_output_stem,  # pass STEM (no extension)
+                    job_id=job_id,
                 )
-                # Normalize the final output path
-                if not final_path:
-                    candidate = local_output_stem + ".mp4"
-                    final_path = candidate if os.path.exists(candidate) else None
+            )
 
-                if not final_path or not os.path.exists(final_path):
-                    logger.error(f"[Task] Output not found (final_path={final_path})")
-                    job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "no_output_file"})
-                    return {"job_id": job_id, "status": "failed", "error": "no_output_file"}
+            # Normalize candidates to find the real output
+            candidates = []
+            if returned_path:
+                candidates.append(returned_path)
+                if not returned_path.lower().endswith(".mp4"):
+                    candidates.append(returned_path + ".mp4")
+            # Also consider the stem we gave it
+            candidates.append(local_output_stem + ".mp4")
 
-                size = os.path.getsize(final_path)
-                if size < 1024:
-                    logger.error(f"[Task] Output too small: {size} bytes")
-                    job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "tiny_output"})
-                    return {"job_id": job_id, "status": "failed", "error": "tiny_output"}
+            final_path = None
+            for p in candidates:
+                if p and os.path.exists(p):
+                    final_path = p
+                    break
 
-                logger.info(f"[Task] Render complete: {final_path} ({size} bytes)")
-            except Exception as e:
-                logger.error(f"[Task] Processing failed: {e}")
-                job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "processing_failed"})
-                return {"job_id": job_id, "status": "failed", "error": "processing_failed"}
+            if not final_path:
+                logger.error(
+                    f"[Task] Output file not found. candidates={candidates}"
+                )
+                job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "no_output_file"})
+                return {"job_id": job_id, "status": "failed", "error": "no_output_file"}
 
-            job_store.set(job_id, {"job_id": job_id, "status": "processing", "progress": 90})
+            size = os.path.getsize(final_path)
+            if size < 1024:
+                logger.error(f"[Task] Output too small: {final_path} ({size} bytes)")
+                job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "tiny_output"})
+                return {"job_id": job_id, "status": "failed", "error": "tiny_output"}
+
+            logger.info(f"[Task] Render complete: {final_path} ({size} bytes)")
+        except Exception as e:
+            logger.error(f"[Task] Processing failed: {e}")
+            job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "processing_failed"})
+            return {"job_id": job_id, "status": "failed", "error": "processing_failed"}
+
 
             # 3) Upload output
             try:
