@@ -21,6 +21,10 @@ def health():
 def root():
     return {"service": "billboard-worker", "status": "running"}
 
+@health_app.route('/healthz')  # Add this route
+def healthz():
+    return {"status": "ok"}
+
 def run_health_server():
     """Run health endpoint on separate thread"""
     port = int(os.environ.get("PORT", 8000))
