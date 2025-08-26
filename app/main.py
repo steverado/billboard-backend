@@ -160,7 +160,7 @@ async def generate_asset(
         from app.tasks import process_video_task
 
         job = rq_queue.enqueue(
-            process_video_task,  # String reference only
+            process_video_task,  
             template_name,
             str(user_img_path),
             job_id,
