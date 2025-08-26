@@ -15,7 +15,6 @@ from rq import Queue
 from rq.job import Job
 from app.job_store import job_store
 from app.config import USE_PRESIGNED_URLS, PRESIGNED_URL_EXPIRES_SECS, presign_url
-from app.tasks import process_video_task
 
 
 # from .compositor import EnhancedQualityCompositor# - Comment for better loading speeds for swagger testing#
@@ -158,6 +157,8 @@ async def generate_asset(
         output_path = job_dir / "output.mp4"
 
         # Enqueue background job (RQ job_id == our job_id)
+        from app.tasks import process_video_task
+        
         job = rq_queue.enqueue(
             process_video_task,  # String reference only
             template_name,
