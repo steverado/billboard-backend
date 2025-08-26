@@ -15,6 +15,7 @@ from rq import Queue
 from rq.job import Job
 from app.job_store import job_store
 from app.config import USE_PRESIGNED_URLS, PRESIGNED_URL_EXPIRES_SECS, presign_url
+from app.tasks import process_video_task
 
 
 # from .compositor import EnhancedQualityCompositor# - Comment for better loading speeds for swagger testing#
@@ -157,16 +158,19 @@ async def generate_asset(
         output_path = job_dir / "output.mp4"
 
         # Enqueue background job (RQ job_id == our job_id)
+        # NEW - direct import
+        from app.tasks import process_video_task
+
         job = rq_queue.enqueue(
-            "app.tasks.process_video_task",
+            process_video_task,  # Direct function reference, not string
             template_name,  # template_id
             str(user_img_path),  # user_file
             job_id,  # job_id
             str(output_path),  # output_path
             job_id=job_id,
-            result_ttl=86400,  # keep result 1 day
-            ttl=86400,  # can wait in queue up to 1 day
-            job_timeout=3600,  # 1 hour max processing time
+            result_ttl=86400,
+            ttl=86400,
+            job_timeout=3600,
         )
 
         logger.info(f"[Generate] Enqueued job {job_id}")
