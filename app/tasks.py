@@ -18,6 +18,15 @@ load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 
 logger = logging.getLogger(__name__)
 
+# Add this near the top of worker.py after your existing imports
+try:
+    from app.tasks import process_video_task
+    print("✅ Successfully imported process_video_task")
+except Exception as e:
+    print(f"❌ Failed to import process_video_task: {e}")
+    import traceback
+    traceback.print_exc()
+
 
 def _guess_content_type(path: str, default: str = "application/octet-stream") -> str:
     ctype, _ = mimetypes.guess_type(path)
