@@ -142,29 +142,30 @@ async def generate_asset(
     try:
         logger.info(f"[Generate] Starting job for template: {template_name}")
 
-        # Create job folder
+        # Create job id
         job_id = str(uuid.uuid4())
-        job_dir = Path(TMP_DIR) / job_id
-        os.makedirs(job_dir, exist_ok=True)
-
         job_store.set(job_id, {"job_id": job_id, "status": "pending"})
 
-        # Save user image
-        user_img_path = job_dir / "user.png"
-        preprocess_user_image(file, user_img_path)
+        # Upload user image directly to S3
+        import boto3, os
+        from botocore.exceptions import ClientError
 
-        # Output path
-        output_path = job_dir / "output.mp4"
+        s3 = boto3.client("s3")
+        bucket = os.getenv("AWS_S3_BUCKET")
+        key = f"inputs/{job_id}/user.png"
+
+        s3.upload_fileobj(file.file, bucket, key)
+        logger.info(f"[Generate] Uploaded input to s3://{bucket}/{key}")
 
         # Enqueue background job (RQ job_id == our job_id)
-        from app.tasks import process_video_task
+        from app.tasks import process_video_task  # local import avoids circulars
 
         job = rq_queue.enqueue(
-            process_video_task,  
+            process_video_task,
             template_name,
-            str(user_img_path),
+            key,            # pass the S3 key instead of local path
             job_id,
-            str(output_path),
+            f"outputs/{job_id}/output.mp4",  # output key in S3
             job_id=job_id,
             result_ttl=86400,
             ttl=86400,

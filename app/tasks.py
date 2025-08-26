@@ -45,74 +45,64 @@ def _upload_to_s3_no_acl(local_path: str, key: str) -> str:
     return f"s3://{bucket}/{key}"
 
 
-def process_video_task(
-    template_name: str, user_image_path: str, job_id: str, output_path: str
-) -> Dict[str, Any]:
+def process_video_task(template_name: str, s3_input_key: str, job_id: str, s3_output_key: str) -> Dict[str, Any]:
     """
-    Background task executed by RQ worker.
+    Worker task: download input from S3, run compositor, upload result back to S3.
+    """
+    import boto3, os, tempfile, asyncio
 
-    Args:
-      - template_name: template id (e.g. 'subway-entrance')
-      - user_image_path: path to the saved user image (PNG/JPG)
-      - job_id: UUID string
-      - output_path: where compositor should write the final mp4
-    """
-    logger.info(f"[Worker] Start job {job_id} template={template_name}")
-    job_store.update(
-        job_id, {"status": "processing", "template": template_name, "progress": 1}
+    logger.info(f"[Task] Starting job {job_id} for template {template_name}")
+
+    s3 = boto3.client("s3")
+    bucket = os.getenv("AWS_S3_BUCKET")
+
+    # Create local temp dir
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_input = os.path.join(tmpdir, "user.png")
+        local_output = os.path.join(tmpdir, "output.mp4")
+
+        # Download input file from S3
+        try:
+            s3.download_file(bucket, s3_input_key, local_input)
+            logger.info(f"[Task] Downloaded input from s3://{bucket}/{s3_input_key}")
+        except Exception as e:
+            logger.error(f"[Task] Failed to download input: {e}")
+            return {"job_id": job_id, "status": "failed", "error": "input_download_failed"}
+
+        # Run compositor
+        try:
+            compositor = EnhancedQualityCompositor()
+            final_path = asyncio.run(
+                compositor.process_video(
+                    template_name,
+                    local_input,
+                    local_output,
+                )
+            )
+            logger.info(f"[Task] Video processing complete: {final_path}")
+        except Exception as e:
+            logger.error(f"[Task] Processing failed: {e}")
+            return {"job_id": job_id, "status": "failed", "error": "processing_failed"}
+
+        # Upload output to S3
+        try:
+            s3.upload_file(local_output, bucket, s3_output_key)
+            logger.info(f"[Task] Uploaded result to s3://{bucket}/{s3_output_key}")
+        except Exception as e:
+            logger.error(f"[Task] Upload failed: {e}")
+            return {"job_id": job_id, "status": "failed", "error": "output_upload_failed"}
+
+    # Return presigned URL for download
+    url = s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": s3_output_key},
+        ExpiresIn=int(os.getenv("PRESIGNED_URL_EXPIRES_SECS", "3600")),
     )
 
-    def _progress_cb(pct: int) -> None:
-        try:
-            job_store.update(job_id, {"status": "processing", "progress": int(pct)})
-        except Exception:
-            pass
+    return {
+        "job_id": job_id,
+        "status": "finished",
+        "url": url,
+        "expires_in": int(os.getenv("PRESIGNED_URL_EXPIRES_SECS", "3600")),
+    }
 
-    try:
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-        # Optional: allow bypassing color-matching if it's flaky today
-        # if os.getenv("SKIP_COLOR_MATCH", "0") == "1":
-        #     EnhancedQualityCompositor.DISABLE_COLOR_MATCH = True
-
-        comp = EnhancedQualityCompositor(quality_preset="high")
-        final_path = asyncio.run(
-            comp.process_video(
-                template_id=template_name,
-                user_file=user_image_path,
-                job_id=job_id,
-                progress_callback=_progress_cb,
-                output_path=output_path,
-            )
-        )
-
-        if not final_path or not os.path.exists(final_path):
-            raise FileNotFoundError(f"Expected output not found at {final_path}")
-        size = os.path.getsize(final_path)
-        if size < 1024:
-            raise ValueError(f"Output too small at {final_path} ({size} bytes)")
-        logger.info(f"[Worker] Rendered file {final_path} ({size} bytes)")
-
-        ext = final_path.rsplit(".", 1)[-1].lower() if "." in final_path else "mp4"
-        key = s3_key_for_job(job_id, ext)
-        s3_uri = _upload_to_s3_no_acl(final_path, key)
-        logger.info(f"[Worker] Uploaded to {s3_uri}")
-
-        job_store.update(
-            job_id,
-            {
-                "status": "finished",
-                "output_key": key,
-                "progress": 100,
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-            },
-        )
-        logger.info(f"[Worker] Job {job_id} finished")
-        return {"job_id": job_id, "status": "finished", "output_key": key}
-
-    except ClientError as ce:
-        logger.error(f"[Worker] S3 upload failed for job {job_id}: {ce}")
-        job_store.update(job_id, {"status": "error", "error": "s3_upload_failed"})
-        raise
-    except Exception as e:
-        logger.err
