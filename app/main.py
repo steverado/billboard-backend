@@ -158,7 +158,7 @@ async def generate_asset(
 
         # Enqueue background job (RQ job_id == our job_id)
         from app.tasks import process_video_task
-        
+
         job = rq_queue.enqueue(
             process_video_task,  # String reference only
             template_name,
