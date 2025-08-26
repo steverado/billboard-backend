@@ -158,7 +158,24 @@ async def generate_asset(
 
         # Enqueue background job (RQ job_id == our job_id)
 
-        # CHANGE BACK TO THIS
+    try:
+        # Lazy import - only imports when function runs, not at startup
+        from app.tasks import process_video_task
+        
+        job = rq_queue.enqueue(
+            process_video_task,  # Direct function reference
+            template_name,
+            str(user_img_path),
+            job_id,
+            str(output_path),
+            job_id=job_id,
+            result_ttl=86400,
+            ttl=86400,
+            job_timeout=3600,
+        )
+    except ImportError as e:
+        logger.error(f"Failed to import process_video_task: {e}")
+        # Fallback to string reference
         job = rq_queue.enqueue(
             "app.tasks.process_video_task",
             template_name,
