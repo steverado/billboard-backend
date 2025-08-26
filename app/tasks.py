@@ -91,6 +91,7 @@ def process_video_task(
                         template_id=template_name,
                         user_file=local_input,
                         output_path=local_output_stem,
+                        job_id=job_id,
                     )
                 )
                 # Normalize the final output path
