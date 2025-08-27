@@ -33,24 +33,21 @@ def process_video_task(
     s3_output_key: str,
 ) -> Dict[str, Any]:
     """
-    Worker task: download input from S3, render locally, upload result to S3.
-    Arguments:
-      - template_name: template id (e.g., 'subway-entrance')
-      - s3_input_key:  'inputs/<job_id>/user.png'
-      - job_id:        uuid
-      - s3_output_key: 'outputs/<job_id>/output.mp4'
+    Download input from S3 -> process locally -> upload output to S3 -> return URL.
+    Expected keys:
+      - inputs/<job_id>/user.png
+      - outputs/<job_id>/output.mp4
     """
     logger.info(f"[Task] Start job={job_id} template={template_name}")
-    job_store.set(job_id, {"job_id": job_id, "status": "processing", "progress": 10})
+    job_store.set(job_id, {"job_id": job_id, "status": "processing", "progress": 5})
 
     bucket = os.getenv("AWS_S3_BUCKET")
     if not bucket:
         logger.error("AWS_S3_BUCKET is not set")
         job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "bucket_not_configured"})
         return {"job_id": job_id, "status": "failed", "error": "bucket_not_configured"}
-    logger.info(f"[Probe] bucket={bucket!r} key={s3_input_key!r}")
 
-    # Sanity: templates must exist in the WORKER image (separate from API)
+    # Ensure templates exist *in the worker image*
     template_mp4 = os.path.join("templates", template_name, "template.mp4")
     tracking_json = os.path.join("templates", template_name, "tracking.json")
     for p in (template_mp4, tracking_json):
@@ -59,6 +56,19 @@ def process_video_task(
             job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "missing_template_assets"})
             return {"job_id": job_id, "status": "failed", "error": "missing_template_assets"}
 
+    # Probe codec ability to open the template
+    try:
+        import cv2
+        cap = cv2.VideoCapture(template_mp4)
+        if not cap.isOpened():
+            logger.error(f"[Probe] OpenCV failed to open template video: {template_mp4}")
+            job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "template_open_failed"})
+            return {"job_id": job_id, "status": "failed", "error": "template_open_failed"}
+        cap.release()
+    except Exception as e:
+        logger.error(f"[Probe] OpenCV probe error: {e}")
+
+    # S3 client (explicit creds/region for clarity)
     s3 = boto3.client(
         "s3",
         aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
@@ -69,13 +79,28 @@ def process_video_task(
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             local_input = os.path.join(tmpdir, "user.png")
-            # IMPORTANT: pass a STEM (no extension) to compositor to avoid double ".mp4"
+            # Pass a STEM (no extension) to compositor to avoid double .mp4
             local_output_stem = os.path.join(tmpdir, "final_output")
 
-            # 1) Download input
+            # --- 1) Download input (strict) ---
             try:
-                s3.download_file(bucket, s3_input_key, local_input)
-                logger.info(f"[Task] Downloaded s3://{bucket}/{s3_input_key} -> {local_input}")
+                logger.info(f"[Probe] bucket={bucket!r} key={s3_input_key!r}")
+                head = s3.head_object(Bucket=bucket, Key=s3_input_key)
+                logger.info(f"[Probe] head_object OK, ContentLength={head.get('ContentLength')}")
+
+                resp = s3.get_object(Bucket=bucket, Key=s3_input_key)
+                body = resp["Body"].read()
+
+                os.makedirs(os.path.dirname(local_input), exist_ok=True)
+                with open(local_input, "wb") as f:
+                    f.write(body)
+
+                if not os.path.exists(local_input):
+                    raise FileNotFoundError(f"Post-write missing: {local_input}")
+                in_size = os.path.getsize(local_input)
+                if in_size == 0:
+                    raise IOError(f"Downloaded input is empty: {local_input}")
+                logger.info(f"[Task] Downloaded {in_size} bytes -> {local_input}")
             except Exception as e:
                 logger.error(f"[Task] Input download failed: {e}")
                 job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "input_download_failed"})
@@ -83,55 +108,52 @@ def process_video_task(
 
             job_store.set(job_id, {"job_id": job_id, "status": "processing", "progress": 40})
 
-                    # 2) Render
-        try:
-            compositor = EnhancedQualityCompositor(quality_preset="high")
-            # Your compositor may write "<stem>.mp4" and return a path with or without ".mp4"
-            returned_path = asyncio.run(
-                compositor.process_video(
-                    template_id=template_name,
-                    user_file=local_input,
-                    output_path=local_output_stem,  # pass STEM (no extension)
-                    job_id=job_id,
+            # --- 2) Render ---
+            try:
+                compositor = EnhancedQualityCompositor(quality_preset="high")
+                returned_path = asyncio.run(
+                    compositor.process_video(
+                        template_id=template_name,
+                        user_file=local_input,
+                        output_path=local_output_stem,  # STEM (no extension)
+                        job_id=job_id,
+                    )
                 )
-            )
 
-            # Normalize candidates to find the real output
-            candidates = []
-            if returned_path:
-                candidates.append(returned_path)
-                if not returned_path.lower().endswith(".mp4"):
-                    candidates.append(returned_path + ".mp4")
-            # Also consider the stem we gave it
-            candidates.append(local_output_stem + ".mp4")
+                # Normalize final output (handle both stem / full path returns)
+                candidates = []
+                if returned_path:
+                    candidates.append(returned_path)
+                    if not returned_path.lower().endswith(".mp4"):
+                        candidates.append(returned_path + ".mp4")
+                candidates.append(local_output_stem + ".mp4")
 
-            final_path = None
-            for p in candidates:
-                if p and os.path.exists(p):
-                    final_path = p
-                    break
+                final_path = None
+                for p in candidates:
+                    if p and os.path.exists(p):
+                        final_path = p
+                        break
 
-            if not final_path:
-                logger.error(
-                    f"[Task] Output file not found. candidates={candidates}"
-                )
-                job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "no_output_file"})
-                return {"job_id": job_id, "status": "failed", "error": "no_output_file"}
+                if not final_path:
+                    logger.error(f"[Task] Output not found. candidates={candidates}")
+                    job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "no_output_file"})
+                    return {"job_id": job_id, "status": "failed", "error": "no_output_file"}
 
-            size = os.path.getsize(final_path)
-            if size < 1024:
-                logger.error(f"[Task] Output too small: {final_path} ({size} bytes)")
-                job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "tiny_output"})
-                return {"job_id": job_id, "status": "failed", "error": "tiny_output"}
+                out_size = os.path.getsize(final_path)
+                if out_size < 1024:
+                    logger.error(f"[Task] Output too small: {final_path} ({out_size} bytes)")
+                    job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "tiny_output"})
+                    return {"job_id": job_id, "status": "failed", "error": "tiny_output"}
 
-            logger.info(f"[Task] Render complete: {final_path} ({size} bytes)")
-        except Exception as e:
-            logger.error(f"[Task] Processing failed: {e}")
-            job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "processing_failed"})
-            return {"job_id": job_id, "status": "failed", "error": "processing_failed"}
+                logger.info(f"[Task] Render complete: {final_path} ({out_size} bytes)")
+            except Exception as e:
+                logger.error(f"[Task] Processing failed: {e}")
+                job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "processing_failed"})
+                return {"job_id": job_id, "status": "failed", "error": "processing_failed"}
 
+            job_store.set(job_id, {"job_id": job_id, "status": "processing", "progress": 90})
 
-            # 3) Upload output
+            # --- 3) Upload output ---
             try:
                 s3.upload_file(
                     final_path,
@@ -153,7 +175,7 @@ def process_video_task(
         job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "worker_exception"})
         return {"job_id": job_id, "status": "failed", "error": "worker_exception"}
 
-    # 4) Return presigned URL & update job_store
+    # --- 4) Presigned URL & final status ---
     try:
         url = s3.generate_presigned_url(
             "get_object",
@@ -171,10 +193,10 @@ def process_video_task(
         "progress": 100,
         "url": url,
     })
-
     return {
         "job_id": job_id,
         "status": "finished",
         "url": url,
         "expires_in": int(os.getenv("PRESIGNED_URL_EXPIRES_SECS", "3600")),
     }
+
