@@ -48,6 +48,15 @@ def process_video_task(
         logger.error("AWS_S3_BUCKET is not set")
         job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "bucket_not_configured"})
         return {"job_id": job_id, "status": "failed", "error": "bucket_not_configured"}
+    logger.info(f"[Probe] bucket={bucket!r} key={s3_input_key!r}")
+
+try:
+    meta = s3.head_object(Bucket=bucket, Key=s3_input_key)
+    logger.info(f"[Probe] head_object OK, ContentLength={meta.get('ContentLength')}")
+except Exception as e:
+    logger.error(f"[Probe] head_object failed: {e}")
+    return {"job_id": job_id, "status": "failed", "error": "input_head_failed"}
+
 
     # Sanity: templates must exist in the WORKER image (separate from API)
     template_mp4 = os.path.join("templates", template_name, "template.mp4")
