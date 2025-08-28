@@ -84,29 +84,54 @@ def _read_frames_with_meta(path: str, max_frames: Optional[int] = None):
     if count == 0:
         raise RuntimeError(f"Source yielded 0 frames: {path}")
     
-def ffmpeg_fallback(frames: Iterable[np.ndarray], out_mp4: str, fps: float, size: tuple[int,int]) -> int:
+def ffmpeg_fallback(frames: Iterable[np.ndarray], out_mp4: str, fps: float, size: Optional[tuple[int,int]] = None) -> int:
     """
     Assemble frames into an .mp4 using ffmpeg (must be available in PATH).
+    Auto-detects (w,h) from the first frame if size is None or invalid.
     Returns the number of frames written.
     """
+    it = iter(frames)
+    try:
+        first = next(it)
+    except StopIteration:
+        raise RuntimeError("ffmpeg_fallback: no frames to write")
+
+    # Normalize first frame to BGR and get size
+    if first.ndim == 2:
+        first = cv2.cvtColor(first, cv2.COLOR_GRAY2BGR)
+    elif first.ndim == 3 and first.shape[2] == 4:
+        first = cv2.cvtColor(first, cv2.COLOR_BGRA2BGR)
+
+    fh, fw = first.shape[:2]
+    if not size or size[0] <= 0 or size[1] <= 0:
+        w, h = fw, fh
+    else:
+        w, h = size
+
+    # Make frames dir and dump PNGs
     tmp_dir = os.path.join(os.path.dirname(out_mp4), "frames")
     os.makedirs(tmp_dir, exist_ok=True)
 
-    w, h = size
     count = 0
-    for idx, frame in enumerate(frames):
+    # write the first frame
+    if (fw, fh) != (w, h):
+        first = cv2.resize(first, (w, h), interpolation=cv2.INTER_AREA)
+    cv2.imwrite(os.path.join(tmp_dir, f"{count:06d}.png"), first)
+    count += 1
+
+    # write the rest
+    for frame in it:
         if frame is None:
             continue
         if frame.ndim == 2:
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-        fh, fw = frame.shape[:2]
-        if (fw, fh) != (w, h):
+        elif frame.ndim == 3 and frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        fh2, fw2 = frame.shape[:2]
+        if (fw2, fh2) != (w, h):
             frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
-        cv2.imwrite(os.path.join(tmp_dir, f"{idx:06d}.png"), frame)
+        cv2.imwrite(os.path.join(tmp_dir, f"{count:06d}.png"), frame)
         count += 1
-
-    if count == 0:
-        raise RuntimeError("ffmpeg_fallback: no frames to write")
 
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -135,52 +160,75 @@ def _write_frames(
     fps: float,
     expect_size: Tuple[int, int],
 ) -> int:
-    """Write frames, enforce size, and log bytes. Returns frames written (or raises)."""
-    w, h = expect_size
+    """Write frames, enforce size, and log bytes. Returns frames written."""
+    it = iter(frames_iter)
+    try:
+        first = next(it)
+    except StopIteration:
+        raise RuntimeError("No frames provided by upstream generator")
 
-    # Try OpenCV writers first; if none open, fall back to ffmpeg.
+    # Normalize first frame to BGR
+    if first.ndim == 2:
+        first = cv2.cvtColor(first, cv2.COLOR_GRAY2BGR)
+    elif first.ndim == 3 and first.shape[2] == 4:
+        first = cv2.cvtColor(first, cv2.COLOR_BGRA2BGR)
+
+    fh, fw = first.shape[:2]
+    w, h = expect_size
+    if w <= 0 or h <= 0:
+        w, h = fw, fh  # auto-derive from first frame
+
+    # Try OpenCV writer first; if no codecs, fall back to ffmpeg (with the first frame + rest).
     try:
         writer = _safe_video_writer(out_path, (w, h), fps)
+        used_ffmpeg = False
     except RuntimeError as e:
         logger.warning(f"[Writer] Falling back to ffmpeg immediately: {e}")
-        return ffmpeg_fallback(frames_iter, out_path, fps, (w, h))
+        # re-chain the first frame + the rest into ffmpeg fallback
+        def chain():
+            yield first
+            for f in it:
+                yield f
+        return ffmpeg_fallback(chain(), out_path, fps, (w, h))
 
     written = 0
-    first_frame_copy = None
 
-    for idx, frame in enumerate(frames_iter):
+    # Write first frame (resizing if needed)
+    if (fw, fh) != (w, h):
+        first_resized = cv2.resize(first, (w, h), interpolation=cv2.INTER_AREA)
+    else:
+        first_resized = first
+    writer.write(first_resized)
+    written += 1
+
+    # Write remaining frames
+    for idx, frame in enumerate(it, start=1):
         if frame is None:
             logger.error(f"[Writer] frame {idx} is None (skipping)")
             continue
-
-        # Ensure 3-channel BGR for OpenCV writer
         if frame.ndim == 2:
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         elif frame.ndim == 3 and frame.shape[2] == 4:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
-        fh, fw = frame.shape[:2]
-        if (fw, fh) != (w, h):
-            logger.warning(f"[Writer] resizing frame {idx} from {fw}x{fh} to {w}x{h}")
+        fh2, fw2 = frame.shape[:2]
+        if (fw2, fh2) != (w, h):
             frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
-
-        if first_frame_copy is None:
-            first_frame_copy = frame.copy()
 
         writer.write(frame)
         written += 1
 
     writer.release()
-    time.sleep(0.1)  # small settle for some filesystems
+    time.sleep(0.1)
 
     exists = os.path.exists(out_path)
     size = os.path.getsize(out_path) if exists else -1
     logger.info(f"[Writer] wrote_frames={written} out_path={out_path} exists={exists} bytes={size}")
 
-    # If OpenCV path failed (0 frames or empty file), fall back to ffmpeg
-    if written == 0 or not exists or size <= 0:
-        logger.warning("[Writer] OpenCV output invalid → trying ffmpeg fallback")
-        return ffmpeg_fallback(frames_iter, out_path, fps, (w, h))
+    if not exists or size <= 0 or written == 0:
+        # Note: at this point the generator is consumed; a second-pass fallback would require buffering.
+        # This situation is rare; it's almost always a codec-open issue handled above.
+        raise RuntimeError("Writer produced an invalid file after writing frames")
 
     return written
 
@@ -332,56 +380,29 @@ class EnhancedQualityCompositor:
         else:
             return cv2.filter2D(overlay, -1, kernel)
 
-    def match_scene_lighting(
-        self, overlay: np.ndarray, background_region: np.ndarray
-    ) -> np.ndarray:
-        """Adjust overlay lighting and color to match the background scene."""
-        if self.color_matching_strength == 0 or background_region.size == 0:
-            return overlay
+    def match_scene_lighting(self, overlay: np.ndarray, background_region: np.ndarray) -> np.ndarray:
+    """Light/color match with scalar stats (robust to odd shapes)."""
+    if self.color_matching_strength == 0 or background_region.size == 0:
+        return overlay
+    try:
+        # Flatten background to [N, C] and compute scalar targets
+        bg = background_region.reshape(-1, background_region.shape[-1] if overlay.ndim == 3 else 1)
+        target_mean = float(np.mean(bg))
+        target_std  = float(np.std(bg))
 
-        try:
-            bg_mean = np.mean(background_region, axis=(0, 1))
-            bg_std = np.std(background_region, axis=(0, 1))
+        ov = overlay.astype(np.float32)
+        ov_mean = float(np.mean(ov))
+        ov_std  = float(max(np.std(ov), 1.0))
 
-            overlay_mean = np.mean(overlay, axis=(0, 1))
-            overlay_std = np.maximum(np.std(overlay, axis=(0, 1)), 1.0)
+        adj = self.color_matching_strength
 
-            corrected = overlay.astype(np.float32)
+        normalized = (ov - ov_mean) / ov_std
+        adjusted   = normalized * (adj * target_std + (1 - adj) * ov_std) + (adj * target_mean + (1 - adj) * ov_mean)
+        return np.clip(adjusted, 0, 255).astype(np.uint8)
+    except Exception as e:
+        logger.warning(f"Color matching failed (robust): {e}")
+        return overlay
 
-            channels = overlay.shape[2] if overlay.ndim == 3 else 1
-            for c in range(min(3, channels)):
-                if overlay.ndim == 3:
-                    channel = corrected[:, :, c]
-                    target_mean = bg_mean[c] if c < len(bg_mean) else float(np.mean(bg_mean))
-                    target_std  = bg_std[c]  if c < len(bg_std)  else float(np.mean(bg_std))
-                else:
-                    channel = corrected
-                    target_mean = float(np.mean(bg_mean))
-                    target_std  = float(np.mean(bg_std))
-
-                adjustment_factor = self.color_matching_strength
-
-                normalized = (channel - overlay_mean[c]) / overlay_std[c]
-                adjusted = (
-                    normalized * target_std * (1 - adjustment_factor)
-                    + normalized * overlay_std[c] * adjustment_factor
-                )
-                adjusted = (
-                    adjusted
-                    + target_mean * adjustment_factor
-                    + overlay_mean[c] * (1 - adjustment_factor)
-                )
-
-                if overlay.ndim == 3:
-                    corrected[:, :, c] = adjusted
-                else:
-                    corrected = adjusted
-
-            return np.clip(corrected, 0, 255).astype(np.uint8)
-
-        except Exception as e:
-            logger.warning(f"Color matching failed: {e}")
-            return overlay
 
     def apply_anti_aliasing_transform(
         self,
