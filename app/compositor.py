@@ -12,6 +12,8 @@ from typing import Dict, List, Tuple, Optional, Callable, Iterable
 from PIL import Image
 from scipy.ndimage import gaussian_filter
 import logging
+import shutil, subprocess  
+
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +83,51 @@ def _read_frames_with_meta(path: str, max_frames: Optional[int] = None):
     cap.release()
     if count == 0:
         raise RuntimeError(f"Source yielded 0 frames: {path}")
+    
+def ffmpeg_fallback(frames: Iterable[np.ndarray], out_mp4: str, fps: float, size: tuple[int,int]) -> int:
+    """
+    Assemble frames into an .mp4 using ffmpeg (must be available in PATH).
+    Returns the number of frames written.
+    """
+    tmp_dir = os.path.join(os.path.dirname(out_mp4), "frames")
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    w, h = size
+    count = 0
+    for idx, frame in enumerate(frames):
+        if frame is None:
+            continue
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        fh, fw = frame.shape[:2]
+        if (fw, fh) != (w, h):
+            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+        cv2.imwrite(os.path.join(tmp_dir, f"{idx:06d}.png"), frame)
+        count += 1
+
+    if count == 0:
+        raise RuntimeError("ffmpeg_fallback: no frames to write")
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg binary not found in PATH")
+
+    cmd = [
+        ffmpeg, "-y",
+        "-framerate", str(int(round(fps or 24))),
+        "-i", os.path.join(tmp_dir, "%06d.png"),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        out_mp4
+    ]
+    logger.info(f"[FFmpeg] {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
+
+    if not os.path.exists(out_mp4) or os.path.getsize(out_mp4) <= 0:
+        raise RuntimeError("ffmpeg_fallback: ffmpeg produced empty file")
+
+    logger.info(f"[FFmpeg] Wrote {count} frames -> {out_mp4}")
+    return count
+
 
 def _write_frames(
     frames_iter: Iterable[np.ndarray],
@@ -88,12 +135,17 @@ def _write_frames(
     fps: float,
     expect_size: Tuple[int, int],
 ) -> int:
-    """Write frames, enforce size, and log bytes. Returns frames written."""
+    """Write frames, enforce size, and log bytes. Returns frames written (or raises)."""
     w, h = expect_size
-    writer = _safe_video_writer(out_path, (w, h), fps)
+
+    # Try OpenCV writers first; if none open, fall back to ffmpeg.
+    try:
+        writer = _safe_video_writer(out_path, (w, h), fps)
+    except RuntimeError as e:
+        logger.warning(f"[Writer] Falling back to ffmpeg immediately: {e}")
+        return ffmpeg_fallback(frames_iter, out_path, fps, (w, h))
 
     written = 0
-    first_frame_dumped = False
     first_frame_copy = None
 
     for idx, frame in enumerate(frames_iter):
@@ -101,7 +153,7 @@ def _write_frames(
             logger.error(f"[Writer] frame {idx} is None (skipping)")
             continue
 
-        # Ensure 3-channel BGR for writer
+        # Ensure 3-channel BGR for OpenCV writer
         if frame.ndim == 2:
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         elif frame.ndim == 3 and frame.shape[2] == 4:
@@ -112,34 +164,23 @@ def _write_frames(
             logger.warning(f"[Writer] resizing frame {idx} from {fw}x{fh} to {w}x{h}")
             frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
 
-        if not first_frame_dumped:
+        if first_frame_copy is None:
             first_frame_copy = frame.copy()
-            first_frame_dumped = True
 
         writer.write(frame)
         written += 1
 
     writer.release()
-
-    # Small fs settle for some environments
-    time.sleep(0.1)
+    time.sleep(0.1)  # small settle for some filesystems
 
     exists = os.path.exists(out_path)
     size = os.path.getsize(out_path) if exists else -1
     logger.info(f"[Writer] wrote_frames={written} out_path={out_path} exists={exists} bytes={size}")
 
-    if written == 0:
-        if first_frame_copy is not None:
-            dbg = os.path.join(os.path.dirname(out_path), "debug_first_frame.png")
-            try:
-                cv2.imwrite(dbg, first_frame_copy)
-                logger.error(f"[Writer] 0 frames written. Saved first frame -> {dbg}")
-            except Exception as e:
-                logger.error(f"[Writer] failed to save debug frame: {e}")
-        raise RuntimeError("No frames written: upstream produced 0 frames or writer failed")
-
-    if not exists or size <= 0:
-        raise RuntimeError(f"Writer produced empty file ({size} bytes). Likely codec/permissions issue.")
+    # If OpenCV path failed (0 frames or empty file), fall back to ffmpeg
+    if written == 0 or not exists or size <= 0:
+        logger.warning("[Writer] OpenCV output invalid → trying ffmpeg fallback")
+        return ffmpeg_fallback(frames_iter, out_path, fps, (w, h))
 
     return written
 

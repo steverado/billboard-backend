@@ -34,9 +34,8 @@ def _resolve_template_paths(template_name: str) -> Tuple[Optional[str], Optional
       /app/app/templates/<name>/...
     Returns: (template_mp4_abs, tracking_json_abs, base_dir_used)
     """
-    # /app/app/tasks.py -> /app
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    app_dir   = os.path.abspath(os.path.dirname(__file__))  # /app/app
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))  # /app
+    app_dir   = os.path.abspath(os.path.dirname(__file__))                      # /app/app
 
     candidates = [
         (os.path.join(repo_root, "templates", template_name, "template.mp4"),
@@ -83,7 +82,16 @@ def process_video_task(
         job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "missing_template_assets"})
         return {"job_id": job_id, "status": "failed", "error": "missing_template_assets"}
 
-    # Probe codec ability to open the template
+    # Preflight: show exactly what the worker sees
+    try:
+        logger.info(f"[Preflight] base_dir={os.path.abspath(base_dir)}")
+        logger.info(f"[Preflight] template_mp4={os.path.abspath(template_mp4)} exists={os.path.exists(template_mp4)}")
+        logger.info(f"[Preflight] tracking_json={os.path.abspath(tracking_json)} exists={os.path.exists(tracking_json)}")
+        logger.info(f"[Preflight] listdir(templates/{template_name}) -> {os.listdir(os.path.dirname(template_mp4))}")
+    except Exception as e:
+        logger.warning(f"[Preflight] listing failed: {e}")
+
+    # Probe that OpenCV can open the template (clear error if not)
     try:
         import cv2
         cap = cv2.VideoCapture(template_mp4)
@@ -98,7 +106,7 @@ def process_video_task(
         job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "opencv_probe_failed"})
         return {"job_id": job_id, "status": "failed", "error": "opencv_probe_failed"}
 
-    # S3 client (explicit creds/region for clarity)
+    # S3 client
     s3 = boto3.client(
         "s3",
         aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
@@ -111,8 +119,8 @@ def process_video_task(
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             local_input = os.path.join(tmpdir, "user.png")
-            # Pass a STEM (no extension) to compositor to avoid double .mp4
-            local_output_stem = os.path.join(tmpdir, "final_output")
+            # IMPORTANT: give a real filename with an extension
+            local_output = os.path.join(tmpdir, "final_output.mp4")
 
             # --- 1) Download input (strict) ---
             try:
@@ -164,28 +172,23 @@ def process_video_task(
                     compositor.process_video(
                         template_id=template_name,
                         user_file=local_input,
-                        output_path=local_output_stem,  # STEM (no extension)
                         job_id=job_id,
-                        # If your compositor supports explicit paths, you can also pass:
+                        output_path=local_output,  # pass the real .mp4 path
                         # template_video_path=os.environ["TEMPLATE_VIDEO_PATH"],
                         # tracking_path=os.environ["TRACKING_JSON_PATH"],
                     )
-            )
+                )
 
-
-                # Normalize final output (handle both stem / full path returns)
+                # Prefer what compositor returns, else fall back to our expected path
                 candidates = []
                 if returned_path:
                     candidates.append(returned_path)
+                    # If the compositor returned a path without .mp4 (unlikely), try .mp4 next to it
                     if not returned_path.lower().endswith(".mp4"):
                         candidates.append(returned_path + ".mp4")
-                candidates.append(local_output_stem + ".mp4")
+                candidates.append(local_output)
 
-                final_path = None
-                for p in candidates:
-                    if p and os.path.exists(p):
-                        final_path = p
-                        break
+                final_path = next((p for p in candidates if p and os.path.exists(p)), None)
 
                 if not final_path:
                     logger.error(f"[Task] Output not found. candidates={candidates}")
@@ -257,3 +260,4 @@ def process_video_task(
         "url": url,
         "expires_in": int(os.getenv("PRESIGNED_URL_EXPIRES_SECS", "3600")),
     }
+
