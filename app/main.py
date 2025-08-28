@@ -2,7 +2,7 @@ import uuid
 import shutil
 import json
 import os
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -36,10 +36,6 @@ logger = logging.getLogger("uvicorn.error")
 
 # FastAPI app
 app = FastAPI()
-
-# after: app = FastAPI()
-from fastapi.responses import JSONResponse
-
 
 @app.get("/healthz", include_in_schema=False)
 def healthz():
@@ -212,54 +208,83 @@ def cleanup_tmp_dir():
 from fastapi.responses import FileResponse
 
 
-@app.get("/job-status/{job_id}")
-async def get_job_status(job_id: str):
+@app.get("/status/{job_id}")
+def status(job_id: str):
+    """
+    Canonical status endpoint backed by RQ job.meta in Redis.
+    Returns: job_id, rq_status, status, progress, stage, url, error
+    """
     try:
-        job = Job.fetch(job_id, connection=redis_conn)
+        job = Job.fetch(job_id, connection=redis_conn)  # public id == RQ id (your enqueue uses job_id=job_id)
     except Exception:
-        # If Redis no longer has the job, fall back to the file existing
-        output_path = Path(TMP_DIR) / job_id / "output.mp4"
-        if output_path.exists():
-            return {"job_id": job_id, "status": "finished", "result": str(output_path)}
-        raise HTTPException(status_code=404, detail="Job not found")
+        # If not found in Redis, report as 404
+        return JSONResponse(status_code=404, content={"detail": "job not found"})
 
-    status = job.get_status()  # queued | started | finished | failed | deferred
-    result = job.result if job.is_finished else None
+    rq_status = job.get_status(refresh=True)  # queued | started | finished | failed | deferred
+    meta = job.meta or {}
+    result = job.result if rq_status == "finished" else None
+    url = meta.get("url") or (result.get("url") if isinstance(result, dict) else None)
 
-    # Extra safety: if marked finished but file not yet present, treat as started
-    if status == "finished":
-        output_path = Path(TMP_DIR) / job_id / "output.mp4"
-        if not output_path.exists():
-            status = "started"
-            result = None
+    payload = {
+        "job_id": job_id,
+        "rq_status": rq_status,
+        "status": meta.get("status", rq_status),   # your worker sets 'status' in meta
+        "progress": meta.get("progress", 0),
+        "stage": meta.get("stage"),
+        "url": url,
+        "error": meta.get("error") or (str(job.exc_info) if rq_status == "failed" else None),
+    }
+    return Response(
+        content=json.dumps(payload),
+        media_type="application/json",
+        headers={"Cache-Control": "no-store"},
+    )
 
-    return {"job_id": job_id, "status": status, "result": result}
+# Back-compat alias for any clients already calling /job-status/{job_id}
+@app.get("/job-status/{job_id}")
+def job_status_alias(job_id: str):
+    return status(job_id)
+
 
 
 # === /output/{job_id} endpoint (presigned URL mode) ===
 @app.get("/output/{job_id}")
 def get_output(job_id: str):
-    job = job_store.get(job_id)
-    if not job:
+    """
+    Return a presigned URL for the output if finished.
+    Reads from RQ job.meta written by the worker task.
+    """
+    try:
+        job = Job.fetch(job_id, connection=redis_conn)
+    except Exception:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    status = job.get("status")
-    if status != "finished":
-        return {"job_id": job_id, "status": status}
+    rq_status = job.get_status(refresh=True)
+    meta = job.meta or {}
 
-    key = job.get("output_key")
-    if not key:
-        raise HTTPException(status_code=500, detail="Output not available yet")
+    if rq_status != "finished" and meta.get("status") != "finished":
+        # Still running (or failed)
+        return {
+            "job_id": job_id,
+            "status": meta.get("status", rq_status),
+            "progress": meta.get("progress", 0),
+            "stage": meta.get("stage"),
+            "error": meta.get("error"),
+        }
 
-    if not USE_PRESIGNED_URLS:
-        raise HTTPException(
-            status_code=500, detail="Server misconfigured: presigned URLs disabled"
-        )
+    # Prefer URL the worker already stored (best case)
+    url = meta.get("url")
 
-    try:
-        url = presign_url(key, expires=PRESIGNED_URL_EXPIRES_SECS)
-    except Exception:
-        raise HTTPException(status_code=500, detail="Failed to generate download URL")
+    # If worker didn't store url for some reason, reconstruct key and presign here
+    if not url:
+        if not USE_PRESIGNED_URLS:
+            raise HTTPException(status_code=500, detail="Presigned URLs disabled")
+        # Your task writes outputs at: outputs/{job_id}/output.mp4
+        output_key = f"outputs/{job_id}/output.mp4"
+        try:
+            url = presign_url(output_key, expires=PRESIGNED_URL_EXPIRES_SECS)
+        except Exception:
+            raise HTTPException(status_code=500, detail="Failed to generate download URL")
 
     return {
         "job_id": job_id,
@@ -267,3 +292,4 @@ def get_output(job_id: str):
         "url": url,
         "expires_in": PRESIGNED_URL_EXPIRES_SECS,
     }
+
