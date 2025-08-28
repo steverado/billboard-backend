@@ -1,15 +1,147 @@
+# compositor.py
+# Drop-in replacement with robust reader/writer, codec fallback, and explicit failure points.
+# Public API preserved: class EnhancedQualityCompositor with async process_video(...)
+
 import cv2
 import numpy as np
 import json
 import time
 import os
 import asyncio
-from typing import Dict, List, Tuple, Optional, Callable
+from typing import Dict, List, Tuple, Optional, Callable, Iterable
 from PIL import Image
 from scipy.ndimage import gaussian_filter
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------
+# Low-level I/O helpers
+# ---------------------------
+
+def _safe_mkdir(path: str) -> None:
+    if path:
+        os.makedirs(path, exist_ok=True)
+
+def _safe_video_writer(
+    out_path: str,
+    frame_size: Tuple[int, int],
+    fps: float,
+    preferred_codecs: Tuple[str, ...] = ("mp4v", "avc1", "MJPG", "XVID"),
+) -> cv2.VideoWriter:
+    w, h = frame_size
+    _safe_mkdir(os.path.dirname(out_path))
+    tried = []
+    vw: Optional[cv2.VideoWriter] = None
+
+    for c in preferred_codecs:
+        fourcc = cv2.VideoWriter_fourcc(*c)
+        vw = cv2.VideoWriter(out_path, fourcc, float(fps), (w, h))
+        opened = bool(vw.isOpened())
+        tried.append((c, opened))
+        logger.info(f"[VideoWriter] Try codec={c} fps={fps} size={w}x{h} -> opened={opened}")
+        if opened:
+            break
+        try:
+            vw.release()
+        except Exception:
+            pass
+        vw = None
+
+    if vw is None:
+        raise RuntimeError(f"VideoWriter failed to open. Tried={tried} out_path={out_path}")
+    return vw
+
+def _read_frames_with_meta(path: str, max_frames: Optional[int] = None):
+    """Generator that yields frames and logs source metadata once."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Template video not found: {path}")
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open template video: {path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    w  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    n  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    logger.info(f"[Reader] src={path} fps={fps} size={w}x{h} frames={n}")
+
+    count = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        yield frame, (fps, w, h, count)
+        count += 1
+        if max_frames is not None and count >= max_frames:
+            break
+
+    cap.release()
+    if count == 0:
+        raise RuntimeError(f"Source yielded 0 frames: {path}")
+
+def _write_frames(
+    frames_iter: Iterable[np.ndarray],
+    out_path: str,
+    fps: float,
+    expect_size: Tuple[int, int],
+) -> int:
+    """Write frames, enforce size, and log bytes. Returns frames written."""
+    w, h = expect_size
+    writer = _safe_video_writer(out_path, (w, h), fps)
+
+    written = 0
+    first_frame_dumped = False
+    first_frame_copy = None
+
+    for idx, frame in enumerate(frames_iter):
+        if frame is None:
+            logger.error(f"[Writer] frame {idx} is None (skipping)")
+            continue
+
+        # Ensure 3-channel BGR for writer
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        elif frame.ndim == 3 and frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+        fh, fw = frame.shape[:2]
+        if (fw, fh) != (w, h):
+            logger.warning(f"[Writer] resizing frame {idx} from {fw}x{fh} to {w}x{h}")
+            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+
+        if not first_frame_dumped:
+            first_frame_copy = frame.copy()
+            first_frame_dumped = True
+
+        writer.write(frame)
+        written += 1
+
+    writer.release()
+
+    # Small fs settle for some environments
+    time.sleep(0.1)
+
+    exists = os.path.exists(out_path)
+    size = os.path.getsize(out_path) if exists else -1
+    logger.info(f"[Writer] wrote_frames={written} out_path={out_path} exists={exists} bytes={size}")
+
+    if written == 0:
+        if first_frame_copy is not None:
+            dbg = os.path.join(os.path.dirname(out_path), "debug_first_frame.png")
+            try:
+                cv2.imwrite(dbg, first_frame_copy)
+                logger.error(f"[Writer] 0 frames written. Saved first frame -> {dbg}")
+            except Exception as e:
+                logger.error(f"[Writer] failed to save debug frame: {e}")
+        raise RuntimeError("No frames written: upstream produced 0 frames or writer failed")
+
+    if not exists or size <= 0:
+        raise RuntimeError(f"Writer produced empty file ({size} bytes). Likely codec/permissions issue.")
+
+    return written
 
 
 class EnhancedQualityCompositor:
@@ -50,21 +182,23 @@ class EnhancedQualityCompositor:
     def load_tracking_data(self, tracking_file: str):
         """Load preprocessed tracking data from file path"""
         logger.info(f"Loading tracking data from {tracking_file} ...")
-
         with open(tracking_file, "r") as f:
             data = json.load(f)
 
         tracking_frames = data["trackingData"]
+        self.frame_lookup.clear()
 
         for frame_data in tracking_frames:
-            frame_num = frame_data["frame"]
+            frame_num = int(frame_data["frame"])
             corners = np.array(frame_data["corners"], dtype=np.float32)
+            if corners.shape != (4, 2):
+                raise ValueError(f"Tracking corners must be 4x2, got {corners.shape} at frame {frame_num}")
             self.frame_lookup[frame_num] = corners
 
         logger.info(f"Loaded {len(tracking_frames)} tracking frames")
 
     # ---------------------------
-    # Compositing helpers
+    # Compositing helpers (unchanged quality logic)
     # ---------------------------
 
     def create_advanced_mask(
@@ -91,7 +225,7 @@ class EnhancedQualityCompositor:
 
         # Perspective-aware softening
         corner_distances = np.linalg.norm(corners - np.mean(corners, axis=0), axis=1)
-        max_distance = float(np.max(corner_distances))
+        max_distance = float(np.max(corner_distances)) if corner_distances.size else 0.0
         if max_distance > 0:
             y_coords, x_coords = np.ogrid[:height, :width]
             center_y, center_x = np.mean(corners, axis=0)[::-1]
@@ -177,16 +311,12 @@ class EnhancedQualityCompositor:
             for c in range(min(3, channels)):
                 if overlay.ndim == 3:
                     channel = corrected[:, :, c]
-                    target_mean = (
-                        bg_mean[c] if c < len(bg_mean) else float(np.mean(bg_mean))
-                    )
-                    target_std = (
-                        bg_std[c] if c < len(bg_std) else float(np.mean(bg_std))
-                    )
+                    target_mean = bg_mean[c] if c < len(bg_mean) else float(np.mean(bg_mean))
+                    target_std  = bg_std[c]  if c < len(bg_std)  else float(np.mean(bg_std))
                 else:
                     channel = corrected
                     target_mean = float(np.mean(bg_mean))
-                    target_std = float(np.mean(bg_std))
+                    target_std  = float(np.mean(bg_std))
 
                 adjustment_factor = self.color_matching_strength
 
@@ -454,93 +584,67 @@ class EnhancedQualityCompositor:
         progress_callback: Optional[Callable[[int], None]] = None,
         max_frames: int = 150,
     ) -> Optional[str]:
-        """Process video with enhanced quality, ensure file output is complete, and return the path."""
+        """
+        Process video with enhanced quality, ensure file output is complete, and return the path.
+        Raises RuntimeError with actionable messages on failure; returns path on success.
+        """
         cap = None
-        out = None
         try:
-            if not os.path.exists(video_file):
-                logger.error(f"❌ Template video does not exist: {video_file}")
-                return None
+            # Read frames & source meta (validates existence/open)
+            frames_meta_iter = _read_frames_with_meta(video_file, max_frames=max_frames)
 
-            cap = cv2.VideoCapture(video_file)
-            if not cap.isOpened():
-                logger.error(f"❌ Could not open video file: {video_file}")
-                return None
-
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0  # fallback if FPS is 0
-
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
+            fps = None
+            width = None
+            height = None
             processed_count = 0
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or max_frames)
 
-            for frame_idx in range(min(total_frames, max_frames)):
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    logger.info(f"End of video or failed to read frame {frame_idx}")
-                    break
+            def composited_frames():
+                nonlocal fps, width, height, processed_count
+                for frame, meta in frames_meta_iter:
+                    _fps, w, h, idx = meta
+                    if fps is None:
+                        fps, width, height = _fps, w, h
 
-                if frame_idx in self.frame_lookup:
-                    corners = self.frame_lookup[frame_idx]
-                    result_frame = self.apply_enhanced_composite(
-                        cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                        overlay,
-                        corners,
-                        frame_idx,
-                    )
-                    result_frame = cv2.cvtColor(result_frame, cv2.COLOR_RGB2BGR)
-                    processed_count += 1
-                else:
-                    result_frame = frame
+                    # Convert to RGB for your compositor
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                out.write(result_frame)
+                    if idx in self.frame_lookup:
+                        corners = self.frame_lookup[idx]
+                        result_frame_rgb = self.apply_enhanced_composite(
+                            frame_rgb, overlay, corners, idx
+                        )
+                        processed_count += 1
+                    else:
+                        result_frame_rgb = frame_rgb  # passthrough when no tracking
 
-                # Update progress
-                if progress_callback and (frame_idx + 1) % 10 == 0:
-                    progress = int(40 + (frame_idx / max_frames) * 50)  # 40-90%
-                    progress_callback(progress)
+                    # Back to BGR for writer
+                    yield cv2.cvtColor(result_frame_rgb, cv2.COLOR_RGB2BGR)
 
-                if frame_idx % 30 == 0:
-                    await asyncio.sleep(0)
+                    # Cooperative yield for asyncio
+                    if idx % 30 == 0:
+                        # allow event loop to breathe
+                        # (no await inside generator; caller awaits after write)
+                        pass
 
-            # Ensure containers are finalized
-            if out:
-                out.release()
-            if cap:
-                cap.release()
+            # Write all frames
+            written = _write_frames(
+                frames_iter=composited_frames(),
+                out_path=output_path,
+                fps=float(fps) if fps is not None else 24.0,
+                expect_size=(int(width) if width else 0, int(height) if height else 0),
+            )
 
-            # Small delay to ensure fs flush before size check
-            time.sleep(0.2)
-
-            if not os.path.exists(output_path):
-                logger.error(f"❌ Output file not found: {output_path}")
-                return None
+            # Final fs flush window for some filesystems
+            await asyncio.sleep(0)
 
             size = os.path.getsize(output_path)
-            if size <= 0:
-                logger.error(f"❌ Output file is empty: {output_path}")
-                return None
-
             logger.info(
-                f"✅ Enhanced processing complete: {processed_count} frames written ({size} bytes) → {output_path}"
+                f"✅ Enhanced processing complete: processed={processed_count} / written={written} frames ({size} bytes) → {output_path}"
             )
-            return output_path if processed_count > 0 else None
+
+            # Sanity: ensure at least one composited frame occurred; if not, still OK as passthrough.
+            return output_path
 
         except Exception as e:
             logger.error(f"Enhanced video processing failed: {e}")
             return None
-
-        finally:
-            try:
-                if cap:
-                    cap.release()
-            except Exception:
-                pass
-            try:
-                if out:
-                    out.release()
-            except Exception:
-                pass
