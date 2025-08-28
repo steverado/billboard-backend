@@ -159,68 +159,49 @@ async def generate_asset(
         job_id = str(uuid.uuid4())
         job_store.set(job_id, {"job_id": job_id, "status": "pending"})
 
-        # --- Upload input directly to S3 (robust) ---
-import boto3
-from botocore.exceptions import NoCredentialsError, ClientError, ParamValidationError
+        # --- Upload input directly to S3 (minimal & robust) ---
+    import boto3
+    from botocore.exceptions import ClientError  # safe; boto3 always brings botocore
 
-bucket = os.getenv("AWS_S3_BUCKET")
-if not bucket:
-    logger.error("[Generate] AWS_S3_BUCKET not set in BACKEND service")
-    return JSONResponse(status_code=500, content={"detail": "AWS_S3_BUCKET not configured"})
+    bucket = os.getenv("AWS_S3_BUCKET")
+    if not bucket:
+        logger.error("[Generate] AWS_S3_BUCKET not set in BACKEND service")
+        return JSONResponse(status_code=500, content={"detail": "AWS_S3_BUCKET not configured"})
 
-region = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
-s3 = boto3.client(
-    "s3",
-    region_name=region,
-    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-)
+    region = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+    s3 = boto3.client("s3", region_name=region)
 
-key = f"inputs/{job_id}/user.png"
+    key = f"inputs/{job_id}/user.png"
 
-# Build ExtraArgs (content type + optional SSE if your bucket enforces it)
-extra_args = {"ContentType": file.content_type or "application/octet-stream"}
-sse = os.getenv("AWS_S3_SSE")  # e.g., "AES256" or "aws:kms"
-if sse:
-    extra_args["ServerSideEncryption"] = sse
-    if sse == "aws:kms":
-        kms_key = os.getenv("AWS_S3_SSE_KMS_KEY_ID")
-        if kms_key:
-            extra_args["SSEKMSKeyId"] = kms_key
+    # ContentType helps later; don't overcomplicate with SSE until needed
+    extra_args = {"ContentType": file.content_type or "application/octet-stream"}
 
-try:
-    # ensure file handle is at start (some middlewares may have read from it)
     try:
-        file.file.seek(0)
-    except Exception:
-        pass
+        # Ensure the file pointer is at start (some middlewares may have read from it)
+        try:
+            file.file.seek(0)
+        except Exception:
+            pass
 
-    s3.upload_fileobj(Fileobj=file.file, Bucket=bucket, Key=key, ExtraArgs=extra_args)
+        # Upload
+        s3.upload_fileobj(file.file, bucket, key, ExtraArgs=extra_args)
 
-    # Verify upload (and log size)
-    head = s3.head_object(Bucket=bucket, Key=key)
-    size = head.get("ContentLength", 0)
-    logger.info(f"[Generate] Uploaded input -> s3://{bucket}/{key} ({size} bytes) region={region}")
+        # Verify and log size
+        head = s3.head_object(Bucket=bucket, Key=key)
+        size = head.get("ContentLength", 0)
+        logger.info(f"[Generate] Uploaded input -> s3://{bucket}/{key} ({size} bytes) region={region}")
 
-except NoCredentialsError:
-    logger.error("[Generate] No AWS credentials available in BACKEND service env")
-    return JSONResponse(status_code=500, content={"detail": "backend missing AWS credentials"})
+    except ClientError as e:
+        err = e.response.get("Error", {})
+        code = err.get("Code", "ClientError")
+        msg = err.get("Message", str(e))
+        logger.error(f"[Generate] S3 client error: code={code} message={msg}")
+        return JSONResponse(status_code=500, content={"detail": f"S3 error: {code}: {msg}"})
+    except Exception as e:
+        logger.exception("[Generate] Unexpected error uploading to S3")
+        return JSONResponse(status_code=500, content={"detail": "Unexpected error uploading to S3"})
+    # --- end upload ---
 
-except ParamValidationError as e:
-    logger.error(f"[Generate] S3 param validation failed: {e}")
-    return JSONResponse(status_code=500, content={"detail": "S3 param validation failed"})
-
-except ClientError as e:
-    err = e.response.get("Error", {})
-    code = err.get("Code", "ClientError")
-    msg = err.get("Message", str(e))
-    logger.error(f"[Generate] S3 client error: code={code} message={msg}")
-    return JSONResponse(status_code=500, content={"detail": f"S3 error: {code}: {msg}"})
-
-except Exception as e:
-    logger.error(f"[Generate] Unexpected error uploading to S3: {e}")
-    return JSONResponse(status_code=500, content={"detail": "Unexpected error uploading to S3"})
-# --- end upload ---
 
 
         # Enqueue (RQ job_id == public id)
