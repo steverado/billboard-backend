@@ -4,7 +4,7 @@ import asyncio
 import tempfile
 import mimetypes
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Tuple, Optional
 
 import boto3
 from botocore.exceptions import ClientError
@@ -26,6 +26,35 @@ def _guess_content_type(path: str, default: str = "application/octet-stream") ->
     return ctype
 
 
+def _resolve_template_paths(template_name: str) -> Tuple[Optional[str], Optional[str], str]:
+    """
+    Resolve absolute paths to template.mp4 and tracking.json in the worker container.
+    Supports both repo layouts:
+      /app/templates/<name>/...
+      /app/app/templates/<name>/...
+    Returns: (template_mp4_abs, tracking_json_abs, base_dir_used)
+    """
+    # /app/app/tasks.py -> /app
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    app_dir   = os.path.abspath(os.path.dirname(__file__))  # /app/app
+
+    candidates = [
+        (os.path.join(repo_root, "templates", template_name, "template.mp4"),
+         os.path.join(repo_root, "templates", template_name, "tracking.json"),
+         repo_root),
+        (os.path.join(app_dir, "templates", template_name, "template.mp4"),
+         os.path.join(app_dir, "templates", template_name, "tracking.json"),
+         app_dir),
+    ]
+
+    for mp4, json_path, base in candidates:
+        if os.path.exists(mp4) and os.path.exists(json_path):
+            return mp4, json_path, base
+
+    # Not found
+    return None, None, repo_root
+
+
 def process_video_task(
     template_name: str,
     s3_input_key: str,
@@ -34,7 +63,7 @@ def process_video_task(
 ) -> Dict[str, Any]:
     """
     Download input from S3 -> process locally -> upload output to S3 -> return URL.
-    Expected keys:
+    Keys:
       - inputs/<job_id>/user.png
       - outputs/<job_id>/output.mp4
     """
@@ -47,14 +76,12 @@ def process_video_task(
         job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "bucket_not_configured"})
         return {"job_id": job_id, "status": "failed", "error": "bucket_not_configured"}
 
-    # Ensure templates exist *in the worker image*
-    template_mp4 = os.path.join("templates", template_name, "template.mp4")
-    tracking_json = os.path.join("templates", template_name, "tracking.json")
-    for p in (template_mp4, tracking_json):
-        if not os.path.exists(p):
-            logger.error(f"[Task] Missing template asset in worker: {p}")
-            job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "missing_template_assets"})
-            return {"job_id": job_id, "status": "failed", "error": "missing_template_assets"}
+    # Resolve template asset absolute paths
+    template_mp4, tracking_json, base_dir = _resolve_template_paths(template_name)
+    if not template_mp4 or not tracking_json:
+        logger.error(f"[Task] Missing template assets for '{template_name}' in worker image")
+        job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "missing_template_assets"})
+        return {"job_id": job_id, "status": "failed", "error": "missing_template_assets"}
 
     # Probe codec ability to open the template
     try:
@@ -65,8 +92,11 @@ def process_video_task(
             job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "template_open_failed"})
             return {"job_id": job_id, "status": "failed", "error": "template_open_failed"}
         cap.release()
+        logger.info(f"[Probe] Template open OK: {template_mp4}")
     except Exception as e:
         logger.error(f"[Probe] OpenCV probe error: {e}")
+        job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "opencv_probe_failed"})
+        return {"job_id": job_id, "status": "failed", "error": "opencv_probe_failed"}
 
     # S3 client (explicit creds/region for clarity)
     s3 = boto3.client(
@@ -76,6 +106,8 @@ def process_video_task(
         region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
     )
 
+    # Process in a temp working dir; also chdir to base_dir so relative paths in compositor resolve
+    cwd_before = os.getcwd()
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             local_input = os.path.join(tmpdir, "user.png")
@@ -108,6 +140,13 @@ def process_video_task(
 
             job_store.set(job_id, {"job_id": job_id, "status": "processing", "progress": 40})
 
+            # Ensure compositor resolves relative paths from base_dir (where templates are)
+            os.chdir(base_dir)
+
+            # Optionally pass explicit paths via env for compositor if it checks env
+            os.environ["TEMPLATE_VIDEO_PATH"] = template_mp4
+            os.environ["TRACKING_JSON_PATH"] = tracking_json
+
             # --- 2) Render ---
             try:
                 compositor = EnhancedQualityCompositor(quality_preset="high")
@@ -117,6 +156,9 @@ def process_video_task(
                         user_file=local_input,
                         output_path=local_output_stem,  # STEM (no extension)
                         job_id=job_id,
+                        # If your compositor supports explicit paths, uncomment the next two lines:
+                        # template_video_path=template_mp4,
+                        # tracking_path=tracking_json,
                     )
                 )
 
@@ -174,6 +216,11 @@ def process_video_task(
         logger.error(f"[Task] Unexpected worker error: {e}")
         job_store.set(job_id, {"job_id": job_id, "status": "error", "error": "worker_exception"})
         return {"job_id": job_id, "status": "failed", "error": "worker_exception"}
+    finally:
+        try:
+            os.chdir(cwd_before)
+        except Exception:
+            pass
 
     # --- 4) Presigned URL & final status ---
     try:
@@ -199,4 +246,3 @@ def process_video_task(
         "url": url,
         "expires_in": int(os.getenv("PRESIGNED_URL_EXPIRES_SECS", "3600")),
     }
-
