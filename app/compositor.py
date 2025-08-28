@@ -381,27 +381,27 @@ class EnhancedQualityCompositor:
             return cv2.filter2D(overlay, -1, kernel)
 
     def match_scene_lighting(self, overlay: np.ndarray, background_region: np.ndarray) -> np.ndarray:
-    """Light/color match with scalar stats (robust to odd shapes)."""
-    if self.color_matching_strength == 0 or background_region.size == 0:
-        return overlay
-    try:
-        # Flatten background to [N, C] and compute scalar targets
-        bg = background_region.reshape(-1, background_region.shape[-1] if overlay.ndim == 3 else 1)
-        target_mean = float(np.mean(bg))
-        target_std  = float(np.std(bg))
+        """Light/color match with scalar stats (robust to odd shapes)."""
+        if self.color_matching_strength == 0 or background_region.size == 0:
+            return overlay
+        try:
+            # Flatten background to [N, C] and compute scalar targets
+            bg = background_region.reshape(-1, background_region.shape[-1] if overlay.ndim == 3 else 1)
+            target_mean = float(np.mean(bg))
+            target_std  = float(np.std(bg))
 
-        ov = overlay.astype(np.float32)
-        ov_mean = float(np.mean(ov))
-        ov_std  = float(max(np.std(ov), 1.0))
+            ov = overlay.astype(np.float32)
+            ov_mean = float(np.mean(ov))
+            ov_std  = float(max(np.std(ov), 1.0))
 
-        adj = self.color_matching_strength
+            adj = self.color_matching_strength
 
-        normalized = (ov - ov_mean) / ov_std
-        adjusted   = normalized * (adj * target_std + (1 - adj) * ov_std) + (adj * target_mean + (1 - adj) * ov_mean)
-        return np.clip(adjusted, 0, 255).astype(np.uint8)
-    except Exception as e:
-        logger.warning(f"Color matching failed (robust): {e}")
-        return overlay
+            normalized = (ov - ov_mean) / ov_std
+            adjusted   = normalized * (adj * target_std + (1 - adj) * ov_std) + (adj * target_mean + (1 - adj) * ov_mean)
+            return np.clip(adjusted, 0, 255).astype(np.uint8)
+        except Exception as e:
+            logger.warning(f"Color matching failed (robust): {e}")
+            return overlay
 
 
     def apply_anti_aliasing_transform(
