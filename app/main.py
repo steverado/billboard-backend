@@ -143,26 +143,35 @@ async def generate_asset(
     template: str | None = Form(None),
     template_name: str | None = Form(None),
 ):
+    import uuid
+    import os
+    import logging
+    import boto3
+    from botocore.exceptions import ClientError
+    from fastapi.responses import JSONResponse
+
+    logger = logging.getLogger("uvicorn.error")
+
     chosen_template = template or template_name
     if not chosen_template:
-        raise ValueError("Missing form field: 'template'")
+        return JSONResponse(status_code=400, content={"detail": "Missing form field: 'template'"})
 
-    # Validate template against registry
-    template_info = next((t for t in TEMPLATE_REGISTRY if t["id"] == chosen_template), None)
-    if not template_info:
-        raise ValueError("Invalid template name")
-
+    # Validate template against registry if you keep TEMPLATE_REGISTRY
     try:
-        logger.info(f"[Generate] Start job for template={chosen_template}")
+        template_info = next((t for t in TEMPLATE_REGISTRY if t["id"] == chosen_template), None)
+    except NameError:
+        template_info = {"id": chosen_template}  # if TEMPLATE_REGISTRY not present, skip strict validation
+    if not template_info:
+        return JSONResponse(status_code=400, content={"detail": "Invalid template name"})
 
-        # Job id
-        job_id = str(uuid.uuid4())
-        job_store.set(job_id, {"job_id": job_id, "status": "pending"})
+    # Create a public job id
+    job_id = str(uuid.uuid4())
+    try:
+        job_store.set(job_id, {"job_id": job_id, "status": "queued", "progress": 5})
+    except Exception:
+        pass
 
-        # --- Upload input directly to S3 (minimal & robust) ---
-    import boto3
-    from botocore.exceptions import ClientError  # safe; boto3 always brings botocore
-
+    # --- Upload input directly to S3 (minimal & robust) ---
     bucket = os.getenv("AWS_S3_BUCKET")
     if not bucket:
         logger.error("[Generate] AWS_S3_BUCKET not set in BACKEND service")
@@ -171,9 +180,7 @@ async def generate_asset(
     region = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
     s3 = boto3.client("s3", region_name=region)
 
-    key = f"inputs/{job_id}/user.png"
-
-    # ContentType helps later; don't overcomplicate with SSE until needed
+    input_key = f"inputs/{job_id}/user.png"
     extra_args = {"ContentType": file.content_type or "application/octet-stream"}
 
     try:
@@ -183,13 +190,12 @@ async def generate_asset(
         except Exception:
             pass
 
-        # Upload
-        s3.upload_fileobj(file.file, bucket, key, ExtraArgs=extra_args)
+        s3.upload_fileobj(file.file, bucket, input_key, ExtraArgs=extra_args)
 
         # Verify and log size
-        head = s3.head_object(Bucket=bucket, Key=key)
+        head = s3.head_object(Bucket=bucket, Key=input_key)
         size = head.get("ContentLength", 0)
-        logger.info(f"[Generate] Uploaded input -> s3://{bucket}/{key} ({size} bytes) region={region}")
+        logger.info(f"[Generate] Uploaded input -> s3://{bucket}/{input_key} ({size} bytes) region={region}")
 
     except ClientError as e:
         err = e.response.get("Error", {})
@@ -202,32 +208,27 @@ async def generate_asset(
         return JSONResponse(status_code=500, content={"detail": "Unexpected error uploading to S3"})
     # --- end upload ---
 
-
-
-        # Enqueue (RQ job_id == public id)
+    # Enqueue worker job (RQ job_id == public id)
+    try:
         from app.tasks import process_video_task  # lazy import to avoid circulars
         rq_queue.enqueue(
             process_video_task,
             chosen_template,
-            key,                                  # S3 input key
+            input_key,                           # S3 input key
             job_id,
-            f"outputs/{job_id}/output.mp4",       # S3 output key
+            f"outputs/{job_id}/output.mp4",      # S3 output key
             job_id=job_id,
             result_ttl=86400,
             ttl=86400,
             job_timeout=3600,
         )
-
         logger.info(f"[Generate] Enqueued job {job_id}")
-        return {"job_id": job_id, "status": "queued"}
-
-    except ValueError as ve:
-        logger.warning(f"[Generate] Validation failed: {ve}")
-        return JSONResponse(status_code=HTTP_400_BAD_REQUEST, content={"detail": str(ve)})
-
     except Exception as e:
-        logger.error(f"[Generate] Unexpected error: {e}")
-        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+        logger.exception("[Generate] Failed to enqueue job")
+        return JSONResponse(status_code=500, content={"detail": "Failed to enqueue processing job"})
+
+    return {"job_id": job_id, "status": "queued"}
+
 
 
 # --------- Startup cleanup (kept) ---------
