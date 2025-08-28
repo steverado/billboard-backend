@@ -1,23 +1,25 @@
+# app/main.py  — DROP-IN
+
 import uuid
 import shutil
 import json
 import os
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
-from starlette.status import HTTP_400_BAD_REQUEST
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-import logging
+
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.exceptions import RequestValidationError
+from starlette.status import HTTP_400_BAD_REQUEST
+
 from redis import Redis
 from rq import Queue
 from rq.job import Job
+
 from app.job_store import job_store
 from app.config import USE_PRESIGNED_URLS, PRESIGNED_URL_EXPIRES_SECS, presign_url
-
-
-# from .compositor import EnhancedQualityCompositor# - Comment for better loading speeds for swagger testing#
 from .config import (
     TMP_DIR,
     TMP_MAX_AGE,
@@ -27,42 +29,58 @@ from .config import (
     QUEUE_NAME,
 )
 
-
+# Redis/RQ
 redis_conn = Redis.from_url(REDIS_URL)
 rq_queue = Queue(QUEUE_NAME, connection=redis_conn)
 
-# Set up logger
+# Logger
 logger = logging.getLogger("uvicorn.error")
 
-# FastAPI app
+# FastAPI
 app = FastAPI()
+
+
+# --------- Health / Root ---------
+
+@app.get("/", include_in_schema=False)
+def root():
+    return {"ok": True, "service": "billboard-backend", "docs": "/docs"}
 
 @app.get("/healthz", include_in_schema=False)
 def healthz():
     return JSONResponse({"ok": True, "service": "billboard-backend"}, status_code=200)
 
-
-# optional alias if you ever point Railway to /health instead
 @app.get("/health", include_in_schema=False)
 def health_alias():
     return {"ok": True}
 
 
-# Middleware
+# --------- CORS (safe prod config) ---------
+# Exact production origins + regex for Lovable preview domains; no credentials.
+ALLOWED_ORIGINS = [
+    "https://nycbillboardgenerator.com",
+    "https://www.nycbillboardgenerator.com",
+    "http://localhost:5173",  # Vite dev
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust as needed
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"https://.*\.lovable\.app",
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["ETag", "Accept-Ranges", "Content-Range", "Content-Length"],
+    allow_credentials=False,
 )
 
-# Create tmp dir if it doesn't exist
+# Ensure tmp dir
 os.makedirs(TMP_DIR, exist_ok=True)
 
 
+# --------- Upload preprocessing (kept) ---------
+
 def preprocess_user_image(upload: UploadFile, input_path: Path) -> None:
-    """Validate and save user-uploaded image."""
+    """Validate and save user-uploaded image (unused in S3 path but kept for local flow)."""
     try:
         if not upload.content_type or not upload.content_type.startswith("image/"):
             raise ValueError("Invalid file type")
@@ -77,75 +95,72 @@ def preprocess_user_image(upload: UploadFile, input_path: Path) -> None:
 
     except Exception as e:
         logger.error(f"[Preprocessing] Failed to preprocess image {input_path}: {e}")
-        raise ValueError(
-            "Invalid image file. Please upload a valid PNG/JPG under 10MB."
-        ) from e
+        raise ValueError("Invalid image file. Please upload a valid PNG/JPG under 10MB.") from e
 
+
+# --------- Templates listing (kept) ---------
 
 from fastapi import APIRouter
 from pydantic import BaseModel
 
 router = APIRouter()
 
-
 class TemplateItem(BaseModel):
     id: str
     name: str
-
 
 @router.get("/templates", response_model=list[TemplateItem])
 def list_templates():
     env_val = os.getenv("ALLOWED_TEMPLATES", "")
     ids = [t.strip() for t in env_val.split(",") if t.strip()]
     if not ids:
-        # fallback: scan templates directory (expects template.mp4 & tracking.json)
+        # Fallback: scan templates dir (expects template.mp4 & tracking.json)
         try:
             ids = [
-                d
-                for d in os.listdir("templates")
+                d for d in os.listdir("templates")
                 if os.path.isdir(os.path.join("templates", d))
             ]
         except FileNotFoundError:
             ids = []
-
-    # Minimal metadata (friendly name == id for now)
     return [{"id": t, "name": t.replace("-", " ").title()} for t in ids]
-
 
 app.include_router(router)
 
 
+# --------- Validation errors ---------
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    return JSONResponse(
-        status_code=HTTP_400_BAD_REQUEST,
-        content={"detail": exc.errors()},
-    )
+    return JSONResponse(status_code=HTTP_400_BAD_REQUEST, content={"detail": exc.errors()})
 
+
+# --------- Generate ---------
 
 @app.post("/generate")
 async def generate_asset(
     file: UploadFile = File(...),
-    template_name: str = Form(...),
+    # Accept both for backwards-compat: prefer `template`, fall back to `template_name`
+    template: str | None = Form(None),
+    template_name: str | None = Form(None),
 ):
-    # Validate template
-    template_info = next(
-        (t for t in TEMPLATE_REGISTRY if t["id"] == template_name), None
-    )
+    chosen_template = template or template_name
+    if not chosen_template:
+        raise ValueError("Missing form field: 'template'")
+
+    # Validate template against registry
+    template_info = next((t for t in TEMPLATE_REGISTRY if t["id"] == chosen_template), None)
     if not template_info:
         raise ValueError("Invalid template name")
 
     try:
-        logger.info(f"[Generate] Starting job for template: {template_name}")
+        logger.info(f"[Generate] Start job for template={chosen_template}")
 
-        # Create job id
+        # Job id
         job_id = str(uuid.uuid4())
         job_store.set(job_id, {"job_id": job_id, "status": "pending"})
 
-        # Upload user image directly to S3
-        import boto3, os
-        from botocore.exceptions import ClientError
-
+        # Upload input directly to S3
+        import boto3
         s3 = boto3.client("s3")
         bucket = os.getenv("AWS_S3_BUCKET")
         key = f"inputs/{job_id}/user.png"
@@ -153,15 +168,14 @@ async def generate_asset(
         s3.upload_fileobj(file.file, bucket, key)
         logger.info(f"[Generate] Uploaded input to s3://{bucket}/{key}")
 
-        # Enqueue background job (RQ job_id == our job_id)
-        from app.tasks import process_video_task  # local import avoids circulars
-
-        job = rq_queue.enqueue(
+        # Enqueue (RQ job_id == public id)
+        from app.tasks import process_video_task  # lazy import to avoid circulars
+        rq_queue.enqueue(
             process_video_task,
-            template_name,
-            key,            # pass the S3 key instead of local path
+            chosen_template,
+            key,                                  # S3 input key
             job_id,
-            f"outputs/{job_id}/output.mp4",  # output key in S3
+            f"outputs/{job_id}/output.mp4",       # S3 output key
             job_id=job_id,
             result_ttl=86400,
             ttl=86400,
@@ -173,23 +187,18 @@ async def generate_asset(
 
     except ValueError as ve:
         logger.warning(f"[Generate] Validation failed: {ve}")
-        return JSONResponse(
-            status_code=HTTP_400_BAD_REQUEST,
-            content={"detail": str(ve)},
-        )
+        return JSONResponse(status_code=HTTP_400_BAD_REQUEST, content={"detail": str(ve)})
 
     except Exception as e:
         logger.error(f"[Generate] Unexpected error: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"detail": "Internal server error"},
-        )
+        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
+
+# --------- Startup cleanup (kept) ---------
 
 @app.on_event("startup")
 def cleanup_tmp_dir():
     """Clean old files in TMP_DIR at startup."""
-    # Ensure tmp path exists before any cleanup
     TMP_DIR.mkdir(parents=True, exist_ok=True)
 
     logger.info("[Startup] Cleaning old temp files...")
@@ -205,8 +214,7 @@ def cleanup_tmp_dir():
                     logger.warning(f"[Cleanup] Failed to delete {subdir}: {e}")
 
 
-from fastapi.responses import FileResponse
-
+# --------- Status / Output / Download ---------
 
 @app.get("/status/{job_id}")
 def status(job_id: str):
@@ -215,9 +223,8 @@ def status(job_id: str):
     Returns: job_id, rq_status, status, progress, stage, url, error
     """
     try:
-        job = Job.fetch(job_id, connection=redis_conn)  # public id == RQ id (your enqueue uses job_id=job_id)
+        job = Job.fetch(job_id, connection=redis_conn)
     except Exception:
-        # If not found in Redis, report as 404
         return JSONResponse(status_code=404, content={"detail": "job not found"})
 
     rq_status = job.get_status(refresh=True)  # queued | started | finished | failed | deferred
@@ -228,26 +235,22 @@ def status(job_id: str):
     payload = {
         "job_id": job_id,
         "rq_status": rq_status,
-        "status": meta.get("status", rq_status),   # your worker sets 'status' in meta
+        "status": meta.get("status", rq_status),
         "progress": meta.get("progress", 0),
         "stage": meta.get("stage"),
         "url": url,
         "error": meta.get("error") or (str(job.exc_info) if rq_status == "failed" else None),
+        # If your worker set them:
+        "s3_bucket": meta.get("s3_bucket"),
+        "s3_key": meta.get("s3_key"),
+        "size": meta.get("size"),
     }
-    return Response(
-        content=json.dumps(payload),
-        media_type="application/json",
-        headers={"Cache-Control": "no-store"},
-    )
+    return Response(content=json.dumps(payload), media_type="application/json", headers={"Cache-Control": "no-store"})
 
-# Back-compat alias for any clients already calling /job-status/{job_id}
 @app.get("/job-status/{job_id}")
 def job_status_alias(job_id: str):
     return status(job_id)
 
-
-
-# === /output/{job_id} endpoint (presigned URL mode) ===
 @app.get("/output/{job_id}")
 def get_output(job_id: str):
     """
@@ -263,7 +266,6 @@ def get_output(job_id: str):
     meta = job.meta or {}
 
     if rq_status != "finished" and meta.get("status") != "finished":
-        # Still running (or failed)
         return {
             "job_id": job_id,
             "status": meta.get("status", rq_status),
@@ -272,24 +274,40 @@ def get_output(job_id: str):
             "error": meta.get("error"),
         }
 
-    # Prefer URL the worker already stored (best case)
     url = meta.get("url")
-
-    # If worker didn't store url for some reason, reconstruct key and presign here
     if not url:
         if not USE_PRESIGNED_URLS:
             raise HTTPException(status_code=500, detail="Presigned URLs disabled")
-        # Your task writes outputs at: outputs/{job_id}/output.mp4
         output_key = f"outputs/{job_id}/output.mp4"
         try:
             url = presign_url(output_key, expires=PRESIGNED_URL_EXPIRES_SECS)
         except Exception:
             raise HTTPException(status_code=500, detail="Failed to generate download URL")
 
-    return {
-        "job_id": job_id,
-        "status": "finished",
-        "url": url,
-        "expires_in": PRESIGNED_URL_EXPIRES_SECS,
-    }
+    return {"job_id": job_id, "status": "finished", "url": url, "expires_in": PRESIGNED_URL_EXPIRES_SECS}
+
+@app.get("/download/{job_id}")
+def download(job_id: str):
+    """
+    Redirect straight to the presigned MP4 for easy download/play.
+    """
+    try:
+        job = Job.fetch(job_id, connection=redis_conn)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    rq_status = job.get_status(refresh=True)
+    meta = job.meta or {}
+    if rq_status != "finished" and meta.get("status") != "finished":
+        raise HTTPException(status_code=409, detail="Job not finished yet")
+
+    url = meta.get("url")
+    if not url:
+        if not USE_PRESIGNED_URLS:
+            raise HTTPException(status_code=500, detail="Presigned URLs disabled")
+        output_key = f"outputs/{job_id}/output.mp4"
+        url = presign_url(output_key, expires=PRESIGNED_URL_EXPIRES_SECS)
+
+    return RedirectResponse(url, status_code=302)
+
 
