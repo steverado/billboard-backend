@@ -140,12 +140,22 @@ def process_video_task(
 
             job_store.set(job_id, {"job_id": job_id, "status": "processing", "progress": 40})
 
-            # Ensure compositor resolves relative paths from base_dir (where templates are)
-            os.chdir(base_dir)
+            # Mirror the expected relative layout inside the temp dir:
+            #   ./templates/<template_name>/template.mp4
+            #   ./templates/<template_name>/tracking.json
+            import shutil
 
-            # Optionally pass explicit paths via env for compositor if it checks env
-            os.environ["TEMPLATE_VIDEO_PATH"] = template_mp4
-            os.environ["TRACKING_JSON_PATH"] = tracking_json
+            rel_tpl_dir = os.path.join(tmpdir, "templates", template_name)
+            os.makedirs(rel_tpl_dir, exist_ok=True)
+            shutil.copy2(template_mp4, os.path.join(rel_tpl_dir, "template.mp4"))
+            shutil.copy2(tracking_json, os.path.join(rel_tpl_dir, "tracking.json"))
+
+            # Set CWD to the temp dir so all compositor-relative paths resolve here
+            os.chdir(tmpdir)
+
+            # Optional hints via env (harmless if compositor ignores them)
+            os.environ["TEMPLATE_VIDEO_PATH"] = os.path.join(rel_tpl_dir, "template.mp4")
+            os.environ["TRACKING_JSON_PATH"] = os.path.join(rel_tpl_dir, "tracking.json")
 
             # --- 2) Render ---
             try:
@@ -156,11 +166,12 @@ def process_video_task(
                         user_file=local_input,
                         output_path=local_output_stem,  # STEM (no extension)
                         job_id=job_id,
-                        # If your compositor supports explicit paths, uncomment the next two lines:
-                        # template_video_path=template_mp4,
-                        # tracking_path=tracking_json,
+                        # If your compositor supports explicit paths, you can also pass:
+                        # template_video_path=os.environ["TEMPLATE_VIDEO_PATH"],
+                        # tracking_path=os.environ["TRACKING_JSON_PATH"],
                     )
-                )
+            )
+
 
                 # Normalize final output (handle both stem / full path returns)
                 candidates = []
