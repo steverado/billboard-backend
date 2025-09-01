@@ -286,7 +286,36 @@ def status(job_id: str):
 
 @app.get("/job-status/{job_id}")
 def job_status_alias(job_id: str):
-    return status(job_id)
+    # Normalized alias for frontends (adds output_url, filename, mime_type)
+    try:
+        job = Job.fetch(job_id, connection=redis_conn)
+    except Exception:
+        return JSONResponse({"job_id": job_id, "status": "not_found"}, status_code=404)
+
+    rq_status = job.get_status(refresh=True)
+    meta = job.meta or {}
+    presigned = meta.get("url")
+    if not presigned and USE_PRESIGNED_URLS and (meta.get("status") == "finished" or rq_status == "finished"):
+        try:
+            presigned = presign_url(f"outputs/{job_id}/output.mp4", expires=PRESIGNED_URL_EXPIRES_SECS)
+        except Exception:
+            presigned = None
+
+    status_str = meta.get("status", rq_status)
+    mime = "video/mp4" if presigned else None
+    filename = f"{job_id}.mp4" if presigned else None
+
+    normalized = {
+        "job_id": job_id,
+        "status": status_str,          # "pending" | "processing" | "finished" | "failed" | "error"
+        "progress": meta.get("progress", 0),
+        "url": presigned,              # keep old key
+        "output_url": presigned,       # add common alt key
+        "mime_type": mime,
+        "filename": filename,
+        "raw": meta,
+    }
+    return JSONResponse(normalized, status_code=200)
 
 @app.get("/output/{job_id}")
 def get_output(job_id: str):
