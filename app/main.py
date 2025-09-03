@@ -1,4 +1,4 @@
-# app/main.py  — DROP-IN
+# app/main.py — DROP-IN (canonical presign + unified status endpoints)
 
 import uuid
 import shutil
@@ -7,10 +7,14 @@ import os
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
+from os.path import basename
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Response
+import boto3
+from botocore.exceptions import ClientError
+
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.exceptions import RequestValidationError
 from starlette.status import HTTP_400_BAD_REQUEST
 
@@ -19,7 +23,7 @@ from rq import Queue
 from rq.job import Job
 
 from app.job_store import job_store
-from app.config import USE_PRESIGNED_URLS, PRESIGNED_URL_EXPIRES_SECS, presign_url
+from app.config import USE_PRESIGNED_URLS, PRESIGNED_URL_EXPIRES_SECS  # <-- no presign import here
 from .config import (
     TMP_DIR,
     TMP_MAX_AGE,
@@ -29,18 +33,38 @@ from .config import (
     QUEUE_NAME,
 )
 
-# Redis/RQ
+# -------------------- AWS / S3 (canonical) --------------------
+
+AWS_S3_BUCKET = os.getenv("AWS_S3_BUCKET")
+AWS_DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+_s3 = boto3.client("s3", region_name=AWS_DEFAULT_REGION)
+
+def presign_url(key: str, expires: int) -> str:
+    """
+    Generate a presigned URL that forces a real file download in browsers.
+    """
+    return _s3.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={
+            "Bucket": AWS_S3_BUCKET,
+            "Key": key,
+            "ResponseContentDisposition": f'attachment; filename="{basename(key)}"',
+            "ResponseContentType": "video/mp4",
+        },
+        ExpiresIn=expires,
+    )
+
+# -------------------- Redis / RQ --------------------
+
 redis_conn = Redis.from_url(REDIS_URL)
 rq_queue = Queue(QUEUE_NAME, connection=redis_conn)
 
-# Logger
-logger = logging.getLogger("uvicorn.error")
+# -------------------- App / Logger --------------------
 
-# FastAPI
+logger = logging.getLogger("uvicorn.error")
 app = FastAPI()
 
-
-# --------- Health / Root ---------
+# -------------------- Health / Root --------------------
 
 @app.get("/", include_in_schema=False)
 def root():
@@ -54,9 +78,8 @@ def healthz():
 def health_alias():
     return {"ok": True}
 
+# -------------------- CORS --------------------
 
-# --------- CORS (safe prod config) ---------
-# Exact production origins + regex for Lovable preview domains; no credentials.
 ALLOWED_ORIGINS = [
     "https://nycbillboardgenerator.com",
     "https://www.nycbillboardgenerator.com",
@@ -76,8 +99,7 @@ app.add_middleware(
 # Ensure tmp dir
 os.makedirs(TMP_DIR, exist_ok=True)
 
-
-# --------- Upload preprocessing (kept) ---------
+# -------------------- Upload preprocessing (kept) --------------------
 
 def preprocess_user_image(upload: UploadFile, input_path: Path) -> None:
     """Validate and save user-uploaded image (unused in S3 path but kept for local flow)."""
@@ -97,8 +119,7 @@ def preprocess_user_image(upload: UploadFile, input_path: Path) -> None:
         logger.error(f"[Preprocessing] Failed to preprocess image {input_path}: {e}")
         raise ValueError("Invalid image file. Please upload a valid PNG/JPG under 10MB.") from e
 
-
-# --------- Templates listing (kept) ---------
+# -------------------- Templates listing (kept) --------------------
 
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -114,7 +135,6 @@ def list_templates():
     env_val = os.getenv("ALLOWED_TEMPLATES", "")
     ids = [t.strip() for t in env_val.split(",") if t.strip()]
     if not ids:
-        # Fallback: scan templates dir (expects template.mp4 & tracking.json)
         try:
             ids = [
                 d for d in os.listdir("templates")
@@ -126,15 +146,13 @@ def list_templates():
 
 app.include_router(router)
 
-
-# --------- Validation errors ---------
+# -------------------- Validation errors --------------------
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(status_code=HTTP_400_BAD_REQUEST, content={"detail": exc.errors()})
 
-
-# --------- Generate ---------
+# -------------------- Generate --------------------
 
 @app.post("/generate")
 async def generate_asset(
@@ -143,15 +161,6 @@ async def generate_asset(
     template: str | None = Form(None),
     template_name: str | None = Form(None),
 ):
-    import uuid
-    import os
-    import logging
-    import boto3
-    from botocore.exceptions import ClientError
-    from fastapi.responses import JSONResponse
-
-    logger = logging.getLogger("uvicorn.error")
-
     chosen_template = template or template_name
     if not chosen_template:
         return JSONResponse(status_code=400, content={"detail": "Missing form field: 'template'"})
@@ -160,7 +169,7 @@ async def generate_asset(
     try:
         template_info = next((t for t in TEMPLATE_REGISTRY if t["id"] == chosen_template), None)
     except NameError:
-        template_info = {"id": chosen_template}  # if TEMPLATE_REGISTRY not present, skip strict validation
+        template_info = {"id": chosen_template}
     if not template_info:
         return JSONResponse(status_code=400, content={"detail": "Invalid template name"})
 
@@ -171,31 +180,25 @@ async def generate_asset(
     except Exception:
         pass
 
-    # --- Upload input directly to S3 (minimal & robust) ---
-    bucket = os.getenv("AWS_S3_BUCKET")
-    if not bucket:
+    # --- Upload input directly to S3 ---
+    if not AWS_S3_BUCKET:
         logger.error("[Generate] AWS_S3_BUCKET not set in BACKEND service")
         return JSONResponse(status_code=500, content={"detail": "AWS_S3_BUCKET not configured"})
-
-    region = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
-    s3 = boto3.client("s3", region_name=region)
 
     input_key = f"inputs/{job_id}/user.png"
     extra_args = {"ContentType": file.content_type or "application/octet-stream"}
 
     try:
-        # Ensure the file pointer is at start (some middlewares may have read from it)
         try:
             file.file.seek(0)
         except Exception:
             pass
 
-        s3.upload_fileobj(file.file, bucket, input_key, ExtraArgs=extra_args)
+        _s3.upload_fileobj(file.file, AWS_S3_BUCKET, input_key, ExtraArgs=extra_args)
 
-        # Verify and log size
-        head = s3.head_object(Bucket=bucket, Key=input_key)
+        head = _s3.head_object(Bucket=AWS_S3_BUCKET, Key=input_key)
         size = head.get("ContentLength", 0)
-        logger.info(f"[Generate] Uploaded input -> s3://{bucket}/{input_key} ({size} bytes) region={region}")
+        logger.info(f"[Generate] Uploaded input -> s3://{AWS_S3_BUCKET}/{input_key} ({size} bytes) region={AWS_DEFAULT_REGION}")
 
     except ClientError as e:
         err = e.response.get("Error", {})
@@ -206,7 +209,6 @@ async def generate_asset(
     except Exception as e:
         logger.exception("[Generate] Unexpected error uploading to S3")
         return JSONResponse(status_code=500, content={"detail": "Unexpected error uploading to S3"})
-    # --- end upload ---
 
     # Enqueue worker job (RQ job_id == public id)
     try:
@@ -223,15 +225,13 @@ async def generate_asset(
             job_timeout=3600,
         )
         logger.info(f"[Generate] Enqueued job {job_id}")
-    except Exception as e:
+    except Exception:
         logger.exception("[Generate] Failed to enqueue job")
         return JSONResponse(status_code=500, content={"detail": "Failed to enqueue processing job"})
 
     return {"job_id": job_id, "status": "queued"}
 
-
-
-# --------- Startup cleanup (kept) ---------
+# -------------------- Startup cleanup (kept) --------------------
 
 @app.on_event("startup")
 def cleanup_tmp_dir():
@@ -250,48 +250,9 @@ def cleanup_tmp_dir():
                 except Exception as e:
                     logger.warning(f"[Cleanup] Failed to delete {subdir}: {e}")
 
+# -------------------- Unified Status / Output / Download --------------------
 
-# --------- Status / Output / Download ---------
-
-@app.get("/status/{job_id}")
-def status(job_id: str):
-    """
-    Canonical status endpoint backed by RQ job.meta in Redis.
-    Returns: job_id, rq_status, status, progress, stage, url, error
-    """
-    try:
-        job = Job.fetch(job_id, connection=redis_conn)
-    except Exception:
-        return JSONResponse(status_code=404, content={"detail": "job not found"})
-
-    rq_status = job.get_status(refresh=True)  # queued | started | finished | failed | deferred
-    meta = job.meta or {}
-    result = job.result if rq_status == "finished" else None
-    url = meta.get("url") or (result.get("url") if isinstance(result, dict) else None)
-
-    payload = {
-        "job_id": job_id,
-        "rq_status": rq_status,
-        "status": meta.get("status", rq_status),
-        "progress": meta.get("progress", 0),
-        "stage": meta.get("stage"),
-        "url": url,
-        "error": meta.get("error") or (str(job.exc_info) if rq_status == "failed" else None),
-        # If your worker set them:
-        "s3_bucket": meta.get("s3_bucket"),
-        "s3_key": meta.get("s3_key"),
-        "size": meta.get("size"),
-    }
-    return Response(content=json.dumps(payload), media_type="application/json", headers={"Cache-Control": "no-store"})
-
-from fastapi import Request
-
-from fastapi import Request
-# assumes: Job, redis_conn, USE_PRESIGNED_URLS, PRESIGNED_URL_EXPIRES_SECS, presign_url are already defined
-
-from fastapi import Request
-
-# Serve BOTH endpoints with the same handler
+# Serve BOTH endpoints with the same handler (per Lovable)
 @app.get("/job-status/{job_id}")
 @app.get("/status/{job_id}")
 def job_status_alias(job_id: str, request: Request):
@@ -300,14 +261,14 @@ def job_status_alias(job_id: str, request: Request):
     except Exception:
         return JSONResponse({"job_id": job_id, "status": "not_found"}, status_code=404)
 
-    rq_status = job.get_status(refresh=True)
+    rq_status = job.get_status(refresh=True)  # queued | started | finished | failed | deferred
     meta = job.meta or {}
 
     status_str = meta.get("status") or rq_status
     progress = int(meta.get("progress", 0))
-    stage = meta.get("stage")  # ← Lovable interface mentions this
+    stage = meta.get("stage")
 
-    # Prefer worker-provided presigned; otherwise presign if finished
+    # Prefer worker-provided presigned; otherwise presign here if finished
     key = meta.get("s3_key") or f"outputs/{job_id}/output.mp4"
     presigned = meta.get("url")
     if (not presigned) and USE_PRESIGNED_URLS and (status_str == "finished" or rq_status == "finished"):
@@ -316,7 +277,7 @@ def job_status_alias(job_id: str, request: Request):
         except Exception:
             presigned = None
 
-    # Direct S3 for download to avoid redirect handling edge cases
+    # Use direct S3 presigned for download (avoid redirect handling quirks)
     public_base = os.getenv("PUBLIC_API_BASE_URL")
     if public_base:
         backend_download = f"{public_base.rstrip('/')}/download/{job_id}"
@@ -329,30 +290,35 @@ def job_status_alias(job_id: str, request: Request):
 
     normalized = {
         "job_id": job_id,
-        "status": status_str,        # queued | processing | finished | error
+        "status": status_str,                 # queued | processing | finished | error
         "progress": progress,
-        "stage": stage,              # ← include for completeness
-        "url": presigned,            # ← Lovable uses this for the video source
+        "stage": stage,
+        "url": presigned,                     # Lovable consumes this for the player
 
         # Helpful extras (harmless if unused)
         "output_url": presigned,
         "download_url": download_url,
         "mime_type": "video/mp4" if presigned else None,
         "filename": f"{job_id}.mp4" if presigned else None,
+
+        # Debug / fallback data
+        "s3_bucket": meta.get("s3_bucket"),
+        "s3_key": key,
+        "size": meta.get("size"),
         "raw": meta,
+
+        # Nested result (some templates read this)
         "result": {
             "url": presigned,
             "download_url": download_url,
         },
     }
-    return JSONResponse(normalized, status_code=200)
-
+    return JSONResponse(normalized, status_code=200, headers={"Cache-Control": "no-store"})
 
 @app.get("/output/{job_id}")
 def get_output(job_id: str):
     """
     Return a presigned URL for the output if finished.
-    Reads from RQ job.meta written by the worker task.
     """
     try:
         job = Job.fetch(job_id, connection=redis_conn)
@@ -383,11 +349,11 @@ def get_output(job_id: str):
 
     return {"job_id": job_id, "status": "finished", "url": url, "expires_in": PRESIGNED_URL_EXPIRES_SECS}
 
-from fastapi.responses import RedirectResponse, JSONResponse
-
 @app.get("/download/{job_id}")
 def download_output(job_id: str):
-    # Fetch job/meta
+    """
+    Browser-friendly download: redirect directly to S3 (attachment).
+    """
     try:
         job = Job.fetch(job_id, connection=redis_conn)
     except Exception:
@@ -397,10 +363,8 @@ def download_output(job_id: str):
     meta = job.meta or {}
     status = meta.get("status") or status
     if status != "finished":
-        # 425 Too Early / 409 Conflict both ok; pick 409 for broader compatibility
         return JSONResponse({"job_id": job_id, "error": "not_ready", "status": status}, status_code=409)
 
-    # Prefer worker-provided presigned URL; presign here if missing
     url = meta.get("url")
     key = meta.get("s3_key") or f"outputs/{job_id}/output.mp4"
 
@@ -413,8 +377,10 @@ def download_output(job_id: str):
     if not url:
         return JSONResponse({"job_id": job_id, "error": "no_output_url"}, status_code=500)
 
-    # IMPORTANT: return an HTTP redirect so the browser downloads the file
-    return RedirectResponse(url, status_code=307)  # 302 also fine
+    return RedirectResponse(url, status_code=307)
+
+# -------------------- EOF --------------------
+
 
 
 

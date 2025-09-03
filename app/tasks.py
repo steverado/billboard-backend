@@ -131,16 +131,25 @@ def _public_url_or_none(bucket: str, key: str) -> Optional[str]:
     return f"{PUBLIC_S3_URL_PREFIX}/{bucket}/{key}"
 
 
-def _presign_or_none(bucket: str, key: str, expires: int) -> Optional[str]:
+# --- presign helper (tasks.py) ---
+import os
+
+def _presign_or_none(bucket: str, key: str, expires: int) -> str | None:
     try:
         return s3.generate_presigned_url(
             ClientMethod="get_object",
-            Params={"Bucket": bucket, "Key": key},
+            Params={
+                "Bucket": bucket,
+                "Key": key,
+                "ResponseContentDisposition": f'attachment; filename="{os.path.basename(key)}"',
+                "ResponseContentType": "video/mp4",
+            },
             ExpiresIn=expires,
         )
     except Exception:
         logger.exception("[Task] Failed to presign output")
         return None
+
 
 
 def process_video_task(
