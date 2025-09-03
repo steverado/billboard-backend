@@ -284,9 +284,11 @@ def status(job_id: str):
     }
     return Response(content=json.dumps(payload), media_type="application/json", headers={"Cache-Control": "no-store"})
 
+from fastapi import Request
+
 @app.get("/job-status/{job_id}")
-def job_status_alias(job_id: str):
-    # Normalized alias for frontends (adds output_url, filename, mime_type)
+def job_status_alias(job_id: str, request: Request):
+    # Normalized alias for frontends (adds output_url, download_url, result.url)
     try:
         job = Job.fetch(job_id, connection=redis_conn)
     except Exception:
@@ -294,26 +296,40 @@ def job_status_alias(job_id: str):
 
     rq_status = job.get_status(refresh=True)
     meta = job.meta or {}
+
+    status_str = meta.get("status", rq_status)
+    progress = int(meta.get("progress", 0))
+
+    # Prefer the worker-written presigned URL; otherwise presign on demand if finished
     presigned = meta.get("url")
-    if not presigned and USE_PRESIGNED_URLS and (meta.get("status") == "finished" or rq_status == "finished"):
+    key = meta.get("s3_key") or f"outputs/{job_id}/output.mp4"
+
+    if not presigned and USE_PRESIGNED_URLS and (status_str == "finished" or rq_status == "finished"):
         try:
-            presigned = presign_url(f"outputs/{job_id}/output.mp4", expires=PRESIGNED_URL_EXPIRES_SECS)
+            presigned = presign_url(key, expires=PRESIGNED_URL_EXPIRES_SECS)
         except Exception:
             presigned = None
 
-    status_str = meta.get("status", rq_status)
-    mime = "video/mp4" if presigned else None
-    filename = f"{job_id}.mp4" if presigned else None
+    # Same-origin download alias avoids S3 CORS weirdness
+    download_url = f"{str(request.base_url).rstrip('/')}/download/{job_id}"
 
     normalized = {
         "job_id": job_id,
-        "status": status_str,          # "pending" | "processing" | "finished" | "failed" | "error"
-        "progress": meta.get("progress", 0),
-        "url": presigned,              # keep old key
-        "output_url": presigned,       # add common alt key
-        "mime_type": mime,
-        "filename": filename,
+        "status": status_str,                 # "queued" | "processing" | "finished" | "failed"
+        "progress": progress,
+        "url": presigned,                     # original key
+        "output_url": presigned,              # common alt key
+        "download_url": download_url,         # same-origin alias
+        "mime_type": "video/mp4" if presigned else None,
+        "filename": f"{job_id}.mp4" if presigned else None,
         "raw": meta,
+
+        # Many frontends read a nested result object
+        "result": {
+            "url": presigned,
+            "output_url": presigned,
+            "download_url": download_url,
+        },
     }
     return JSONResponse(normalized, status_code=200)
 
