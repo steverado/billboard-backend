@@ -309,9 +309,19 @@ def job_status_alias(job_id: str, request: Request):
             presigned = presign_url(key, expires=PRESIGNED_URL_EXPIRES_SECS)
         except Exception:
             presigned = None
+    # BEFORE:
+    #download_url = f"{str(request.base_url).rstrip('/')}/download/{job_id}"
 
-    # Same-origin download alias avoids S3 CORS weirdness
-    download_url = f"{str(request.base_url).rstrip('/')}/download/{job_id}"
+    # AFTER (force a known HTTPS public base, fallback to https):
+    PUBLIC_API_BASE_URL = os.getenv("PUBLIC_API_BASE_URL")  # e.g., https://billboard-backend-production.up.railway.app
+    if PUBLIC_API_BASE_URL:
+        download_url = f"{PUBLIC_API_BASE_URL.rstrip('/')}/download/{job_id}"
+    else:
+        base = str(request.base_url).rstrip('/')
+        if base.startswith("http://"):
+            base = "https://" + base[len("http://"):]
+        download_url = f"{base}/download/{job_id}"
+
 
     normalized = {
         "job_id": job_id,
