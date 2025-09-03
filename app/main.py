@@ -383,28 +383,38 @@ def get_output(job_id: str):
 
     return {"job_id": job_id, "status": "finished", "url": url, "expires_in": PRESIGNED_URL_EXPIRES_SECS}
 
+from fastapi.responses import RedirectResponse, JSONResponse
+
 @app.get("/download/{job_id}")
-def download(job_id: str):
-    """
-    Redirect straight to the presigned MP4 for easy download/play.
-    """
+def download_output(job_id: str):
+    # Fetch job/meta
     try:
         job = Job.fetch(job_id, connection=redis_conn)
     except Exception:
-        raise HTTPException(status_code=404, detail="Job not found")
+        return JSONResponse({"job_id": job_id, "error": "not_found"}, status_code=404)
 
-    rq_status = job.get_status(refresh=True)
+    status = job.get_status(refresh=True)
     meta = job.meta or {}
-    if rq_status != "finished" and meta.get("status") != "finished":
-        raise HTTPException(status_code=409, detail="Job not finished yet")
+    status = meta.get("status") or status
+    if status != "finished":
+        # 425 Too Early / 409 Conflict both ok; pick 409 for broader compatibility
+        return JSONResponse({"job_id": job_id, "error": "not_ready", "status": status}, status_code=409)
 
+    # Prefer worker-provided presigned URL; presign here if missing
     url = meta.get("url")
-    if not url:
-        if not USE_PRESIGNED_URLS:
-            raise HTTPException(status_code=500, detail="Presigned URLs disabled")
-        output_key = f"outputs/{job_id}/output.mp4"
-        url = presign_url(output_key, expires=PRESIGNED_URL_EXPIRES_SECS)
+    key = meta.get("s3_key") or f"outputs/{job_id}/output.mp4"
 
-    return RedirectResponse(url, status_code=302)
+    if (not url) and USE_PRESIGNED_URLS:
+        try:
+            url = presign_url(key, expires=PRESIGNED_URL_EXPIRES_SECS)
+        except Exception as e:
+            return JSONResponse({"job_id": job_id, "error": "presign_failed", "detail": str(e)}, status_code=500)
+
+    if not url:
+        return JSONResponse({"job_id": job_id, "error": "no_output_url"}, status_code=500)
+
+    # IMPORTANT: return an HTTP redirect so the browser downloads the file
+    return RedirectResponse(url, status_code=307)  # 302 also fine
+
 
 
