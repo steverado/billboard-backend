@@ -289,7 +289,11 @@ from fastapi import Request
 from fastapi import Request
 # assumes: Job, redis_conn, USE_PRESIGNED_URLS, PRESIGNED_URL_EXPIRES_SECS, presign_url are already defined
 
+from fastapi import Request
+
+# Serve BOTH endpoints with the same handler
 @app.get("/job-status/{job_id}")
+@app.get("/status/{job_id}")
 def job_status_alias(job_id: str, request: Request):
     try:
         job = Job.fetch(job_id, connection=redis_conn)
@@ -301,8 +305,9 @@ def job_status_alias(job_id: str, request: Request):
 
     status_str = meta.get("status") or rq_status
     progress = int(meta.get("progress", 0))
+    stage = meta.get("stage")  # ← Lovable interface mentions this
 
-    # Prefer worker-provided presigned URL; otherwise presign here if finished
+    # Prefer worker-provided presigned; otherwise presign if finished
     key = meta.get("s3_key") or f"outputs/{job_id}/output.mp4"
     presigned = meta.get("url")
     if (not presigned) and USE_PRESIGNED_URLS and (status_str == "finished" or rq_status == "finished"):
@@ -311,7 +316,7 @@ def job_status_alias(job_id: str, request: Request):
         except Exception:
             presigned = None
 
-    # Fallback same-origin download link (HTTPS), only used if we don't have a presigned URL
+    # Direct S3 for download to avoid redirect handling edge cases
     public_base = os.getenv("PUBLIC_API_BASE_URL")
     if public_base:
         backend_download = f"{public_base.rstrip('/')}/download/{job_id}"
@@ -320,29 +325,28 @@ def job_status_alias(job_id: str, request: Request):
         if base.startswith("http://"):
             base = "https://" + base[len("http://"):]
         backend_download = f"{base}/download/{job_id}"
-
-    # Use direct S3 presigned URL for download_url to avoid frontend redirect handling issues
     download_url = presigned or backend_download
 
     normalized = {
         "job_id": job_id,
-        "status": status_str,          # "queued" | "processing" | "finished" | "failed"
+        "status": status_str,        # queued | processing | finished | error
         "progress": progress,
-        "url": presigned,              # original key
-        "output_url": presigned,       # common alt key
-        "download_url": download_url,  # now direct S3 URL when available
+        "stage": stage,              # ← include for completeness
+        "url": presigned,            # ← Lovable uses this for the video source
+
+        # Helpful extras (harmless if unused)
+        "output_url": presigned,
+        "download_url": download_url,
         "mime_type": "video/mp4" if presigned else None,
         "filename": f"{job_id}.mp4" if presigned else None,
-        "s3_bucket": meta.get("s3_bucket"),
-        "s3_key": key,
         "raw": meta,
         "result": {
             "url": presigned,
-            "output_url": presigned,
             "download_url": download_url,
         },
     }
     return JSONResponse(normalized, status_code=200)
+
 
 @app.get("/output/{job_id}")
 def get_output(job_id: str):
