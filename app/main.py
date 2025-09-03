@@ -286,9 +286,11 @@ def status(job_id: str):
 
 from fastapi import Request
 
+from fastapi import Request
+# assumes: Job, redis_conn, USE_PRESIGNED_URLS, PRESIGNED_URL_EXPIRES_SECS, presign_url are already defined
+
 @app.get("/job-status/{job_id}")
 def job_status_alias(job_id: str, request: Request):
-    # Normalized alias for frontends (adds output_url, download_url, result.url)
     try:
         job = Job.fetch(job_id, connection=redis_conn)
     except Exception:
@@ -297,44 +299,43 @@ def job_status_alias(job_id: str, request: Request):
     rq_status = job.get_status(refresh=True)
     meta = job.meta or {}
 
-    status_str = meta.get("status", rq_status)
+    status_str = meta.get("status") or rq_status
     progress = int(meta.get("progress", 0))
 
-    # Prefer the worker-written presigned URL; otherwise presign on demand if finished
-    presigned = meta.get("url")
+    # Prefer worker-provided presigned URL; otherwise presign here if finished
     key = meta.get("s3_key") or f"outputs/{job_id}/output.mp4"
-
-    if not presigned and USE_PRESIGNED_URLS and (status_str == "finished" or rq_status == "finished"):
+    presigned = meta.get("url")
+    if (not presigned) and USE_PRESIGNED_URLS and (status_str == "finished" or rq_status == "finished"):
         try:
             presigned = presign_url(key, expires=PRESIGNED_URL_EXPIRES_SECS)
         except Exception:
             presigned = None
-    # BEFORE:
-    #download_url = f"{str(request.base_url).rstrip('/')}/download/{job_id}"
 
-    # AFTER (force a known HTTPS public base, fallback to https):
-    PUBLIC_API_BASE_URL = os.getenv("PUBLIC_API_BASE_URL")  # e.g., https://billboard-backend-production.up.railway.app
-    if PUBLIC_API_BASE_URL:
-        download_url = f"{PUBLIC_API_BASE_URL.rstrip('/')}/download/{job_id}"
+    # Fallback same-origin download link (HTTPS), only used if we don't have a presigned URL
+    public_base = os.getenv("PUBLIC_API_BASE_URL")
+    if public_base:
+        backend_download = f"{public_base.rstrip('/')}/download/{job_id}"
     else:
         base = str(request.base_url).rstrip('/')
         if base.startswith("http://"):
             base = "https://" + base[len("http://"):]
-        download_url = f"{base}/download/{job_id}"
+        backend_download = f"{base}/download/{job_id}"
 
+    # Use direct S3 presigned URL for download_url to avoid frontend redirect handling issues
+    download_url = presigned or backend_download
 
     normalized = {
         "job_id": job_id,
-        "status": status_str,                 # "queued" | "processing" | "finished" | "failed"
+        "status": status_str,          # "queued" | "processing" | "finished" | "failed"
         "progress": progress,
-        "url": presigned,                     # original key
-        "output_url": presigned,              # common alt key
-        "download_url": download_url,         # same-origin alias
+        "url": presigned,              # original key
+        "output_url": presigned,       # common alt key
+        "download_url": download_url,  # now direct S3 URL when available
         "mime_type": "video/mp4" if presigned else None,
         "filename": f"{job_id}.mp4" if presigned else None,
+        "s3_bucket": meta.get("s3_bucket"),
+        "s3_key": key,
         "raw": meta,
-
-        # Many frontends read a nested result object
         "result": {
             "url": presigned,
             "output_url": presigned,
